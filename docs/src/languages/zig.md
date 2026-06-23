@@ -11,6 +11,7 @@ languages.zig = {
 ```
 
 This will automatically:
+
 - Use the specified Zig version from zig-overlay
 - Install the corresponding ZLS version (e.g., version "0.15.1" uses ZLS 0.15.0)
 
@@ -40,12 +41,18 @@ boolean
 
 
 *Default:*
-` false `
+
+```nix
+false
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/zig\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
@@ -66,7 +73,10 @@ package
 
 
 *Default:*
-` pkgs.zig `
+
+```nix
+pkgs.zig
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/zig\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
@@ -87,12 +97,18 @@ boolean
 
 
 *Default:*
-` true `
+
+```nix
+true
+```
 
 
 
 *Example:*
-` true `
+
+```nix
+true
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/zig\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
@@ -113,7 +129,10 @@ package
 
 
 *Default:*
-` pkgs.zls `
+
+```nix
+pkgs.zls
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/zig\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)
@@ -135,12 +154,18 @@ null or string
 
 
 *Default:*
-` null `
+
+```nix
+null
+```
 
 
 
 *Example:*
-` "0.15.1" `
+
+```nix
+"0.15.1"
+```
 
 *Declared by:*
  - [https://github\.com/cachix/devenv/blob/main/src/modules/languages/zig\.nix](https://github.com/cachix/devenv/blob/main/src/modules/languages/zig.nix)

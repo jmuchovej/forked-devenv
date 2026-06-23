@@ -71,6 +71,26 @@ cargo run --bin tui-replay trace.jsonl
 cargo run --bin tui-replay <(zstd -dc trace.jsonl.zst)
 ```
 
+#### Long lived mode (for fuzzing)
+
+`--hold` keeps the TUI running after the trace drains, so the data stream is
+deterministic while the program stays live for input. `--loop N` replays the
+trace N times (0 = forever) for continuous data churn. Together they make a
+stable target for a terminal fuzzer such as `bombadil terminal test`:
+
+```bash
+cargo build -p devenv-tui --features deterministic-tui --bin tui-replay
+bombadil terminal test --time-limit 20s --output-path /tmp/bombadil-out \
+  -- ./target/debug/tui-replay --hold --loop 0 devenv-tui/replays/quick-test
+```
+
+The fuzzer spawns the program in its own PTY and injects random input; the
+process exits only on Ctrl+C or when `--time-limit` is reached. Reproduce a
+failing run with `bombadil terminal test --reproduce /tmp/bombadil-out -- ...`.
+
+Note: the trace at `--output-path` records the full terminal grid per sampled
+state, so it grows fast (multiple GB for a 20s run) — delete it after triage.
+
 ## Views
 
 **Main view**: Shows activity tree with inline log previews. Does not use alternate screen buffer, so terminal scrollback is preserved.
@@ -96,10 +116,19 @@ cargo run --bin tui-replay <(zstd -dc trace.jsonl.zst)
 ### Main View
 - `↑/↓` or `j/k`: Navigate activities
 - `Ctrl+E`: Expand logs for selected activity
+- `Ctrl+R`: Restart the selected managed process
+- `Ctrl+C`: Show the quit prompt without stopping managed processes
+- `c` or `Esc`: Keep running and clear the prompt
+- `q` or `Ctrl+C`: Quit from the interrupt prompt
 - `Esc`: Clear selection
 
 ### Expanded Logs
+Long lines wrap onto continuation rows so their full content stays readable.
+
 - `↑/↓` or `j/k`: Scroll one line
 - `PgUp/PgDn` or `Space`: Scroll page
 - `g/G`: Jump to top/bottom
+- `Ctrl+C`: Copy the current selection, or show the quit prompt when no selection is active
+- `c` or `Esc`: Keep running and clear the prompt
+- `q` or `Ctrl+C`: Quit from the interrupt prompt
 - `q/Esc`: Return to main view

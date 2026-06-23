@@ -1,17 +1,11 @@
 use super::span_timings::SpanTimings;
 
-use console::style;
 use std::{
     fmt,
     sync::atomic::{AtomicBool, Ordering},
 };
 use tracing::{Event, Subscriber, field::Field, span};
-use tracing_subscriber::{
-    field::Visit,
-    fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
-    layer,
-    registry::LookupSpan,
-};
+use tracing_subscriber::{field::Visit, layer, registry::LookupSpan};
 
 /// Capture additional context during a span.
 #[derive(Debug)]
@@ -22,29 +16,6 @@ struct SpanContext {
     has_error: bool,
     /// Span timings
     timings: SpanTimings,
-}
-
-/// The kind of span event based on its lifecycle.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum SpanKind {
-    /// Marks the start of a span.
-    /// Equivalent to [tracing_subscriber::fmt::format::FmtSpan::NEW].
-    Start = 0,
-    /// Marks the end of a span.
-    /// Equivalent to [tracing_subscriber::fmt::format::FmtSpan::CLOSE].
-    End = 1,
-}
-
-impl TryFrom<u8> for SpanKind {
-    type Error = ();
-
-    fn try_from(value: u8) -> Result<Self, ()> {
-        match value {
-            0 => Ok(SpanKind::Start),
-            1 => Ok(SpanKind::End),
-            _ => Err(()),
-        }
-    }
 }
 
 /// A helper to create child events from a span.
@@ -65,6 +36,27 @@ macro_rules! with_event_from_span {
     };
 }
 
+/// Span lifecycle layer.
+///
+/// Emits synthetic events when activity spans (those carrying a
+/// `devenv.ui.message` attribute) open and close. Each event sets
+/// `devenv.span_end = false` (Start) or `true` (End); `--trace-to` exporters
+/// (JSON / pretty / OTLP) use these to surface activity boundaries with their
+/// user-friendly message and total duration. The activity channel consumer
+/// ([`crate::console::ConsoleOutput`] or the TUI) renders activities to the
+/// terminal.
+///
+/// Field convention (each name has a single type, no overloading):
+/// - `devenv.ui.message` (String, span attribute): the activity's display name.
+///   Set on the span by `Activity::start!`. Read here to populate
+///   [`SpanContext::msg`].
+/// - `devenv.span_end` (bool, event field): emitted only on synthetic events
+///   from this layer (false = Start, true = End). Presence signals
+///   "do not render to the CLI".
+///
+/// User-facing one-shot messages from non-activity code use
+/// `devenv_activity::message(level, text)` and flow through the activity
+/// channel — they are not represented as a tracing field here.
 #[derive(Default)]
 pub struct DevenvLayer {
     /// Whether the span has an error event.
@@ -95,7 +87,7 @@ where
             fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
 
             fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "devenv.user_message" {
+                if field.name() == "devenv.ui.message" {
                     self.user_message = Some(value.to_string());
                 }
             }
@@ -106,29 +98,31 @@ where
 
         let mut ext = span.extensions_mut();
 
-        if let Some(msg) = visitor.user_message {
-            ext.insert(SpanContext {
-                msg: msg.clone(),
-                has_error: false,
-                timings: SpanTimings::new(),
-            });
+        // Activity spans carry `devenv.ui.message`; plain `#[instrument]` spans
+        // don't. Fall back to the span name so every span emits start/end events
+        // — `json_subscriber` doesn't synthesize span lifecycle on its own.
+        let msg = visitor
+            .user_message
+            .unwrap_or_else(|| span.metadata().name().to_string());
 
-            // Emit a start event to show the initial message
-            let msg = msg.clone();
-            with_event_from_span!(
-                id,
-                span,
-                "message" = msg,
-                "devenv.ui.message" = true,
-                "devenv.span_event_kind" = SpanKind::Start as u8,
-                "devenv.span_has_error" = false,
-                |event| {
-                    drop(ext);
-                    drop(span);
-                    ctx.event(&event);
-                }
-            );
-        }
+        ext.insert(SpanContext {
+            msg: msg.clone(),
+            has_error: false,
+            timings: SpanTimings::new(),
+        });
+
+        with_event_from_span!(
+            id,
+            span,
+            "message" = msg,
+            "devenv.span_end" = false,
+            "devenv.span_has_error" = false,
+            |event| {
+                drop(ext);
+                drop(span);
+                ctx.event(&event);
+            }
+        );
     }
 
     fn on_enter(&self, id: &span::Id, ctx: layer::Context<'_, S>) {
@@ -167,8 +161,7 @@ where
                 id,
                 span,
                 "message" = msg,
-                "devenv.ui.message" = true,
-                "devenv.span_event_kind" = SpanKind::End as u8,
+                "devenv.span_end" = true,
                 "devenv.span_has_error" = has_error,
                 "devenv.time_total" = time_total,
                 |event| {
@@ -185,123 +178,5 @@ where
         if event.metadata().level() == &tracing::Level::ERROR {
             self.has_error.store(true, Ordering::SeqCst);
         }
-    }
-}
-
-#[derive(Default)]
-pub struct DevenvFormat {
-    pub verbose: bool,
-}
-
-impl<S, F> FormatEvent<S, F> for DevenvFormat
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    F: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self,
-        ctx: &FmtContext<'_, S, F>,
-        mut writer: Writer<'_>,
-        event: &Event<'_>,
-    ) -> fmt::Result {
-        #[derive(Debug, Default)]
-        struct EventVisitor {
-            message: Option<String>,
-            is_user_message: bool,
-            span_event_kind: Option<SpanKind>,
-        }
-
-        impl Visit for EventVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-                if field.name() == "message" {
-                    self.message = Some(format!("{value:?}"));
-                }
-            }
-
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = Some(value.to_string());
-                }
-            }
-
-            fn record_bool(&mut self, field: &Field, value: bool) {
-                if field.name() == "devenv.ui.message" {
-                    self.is_user_message = value;
-                }
-            }
-
-            fn record_u64(&mut self, field: &Field, value: u64) {
-                if field.name() == "devenv.span_event_kind" {
-                    self.span_event_kind = SpanKind::try_from(value as u8).ok()
-                }
-            }
-        }
-
-        let mut visitor = EventVisitor::default();
-        event.record(&mut visitor);
-
-        if let Some(span_kind) = visitor.span_event_kind
-            && let Some(span) = ctx.parent_span()
-        {
-            let ext = span.extensions();
-
-            if let Some(span_ctx) = ext.get::<SpanContext>()
-                && visitor.is_user_message
-            {
-                let ansi = writer.has_ansi_escapes();
-                let time_total = format!("{}", span_ctx.timings.total_duration());
-                let has_error = span_ctx.has_error;
-                let msg = &span_ctx.msg;
-                match span_kind {
-                    SpanKind::Start => {
-                        if ansi {
-                            write!(writer, "{prefix} ", prefix = style("•").blue())?;
-                        }
-                        return writeln!(writer, "{msg}");
-                    }
-
-                    SpanKind::End => {
-                        if ansi {
-                            let prefix = if has_error {
-                                style("✖").red()
-                            } else {
-                                style("✓").green()
-                            };
-                            write!(writer, "{prefix} ")?;
-                        }
-                        return writeln!(writer, "{msg} in {time_total}");
-                    }
-                }
-            }
-        }
-        if let Some(msg) = visitor.message {
-            if visitor.is_user_message {
-                let meta = event.metadata();
-                let ansi = writer.has_ansi_escapes();
-
-                if ansi && !self.verbose {
-                    let level = meta.level();
-                    match *level {
-                        tracing::Level::ERROR => {
-                            write!(writer, "{} ", style("✖").red())?;
-                        }
-                        tracing::Level::WARN => {
-                            write!(writer, "{} ", style("•").yellow())?;
-                        }
-                        tracing::Level::INFO => {
-                            write!(writer, "{} ", style("•").blue())?;
-                        }
-                        tracing::Level::DEBUG => {
-                            write!(writer, "{} ", style("•").italic())?;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            writeln!(writer, "{msg}")?;
-        };
-
-        Ok(())
     }
 }

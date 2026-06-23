@@ -7,19 +7,23 @@ let
     else config.name;
   types = lib.types;
   envContainerName = builtins.getEnv "DEVENV_CONTAINER";
+  projectRoot = builtins.path { path = self; name = "source"; };
 
-  nix2containerInput = config.lib.getInput {
-    name = "nix2container";
-    url = "github:nlewo/nix2container";
-    attribute = "containers";
-    follows = [ "nixpkgs" ];
-  };
-  nix2container = nix2containerInput.packages.${pkgs.stdenv.system};
-  mk-shell-bin = config.lib.getInput {
-    name = "mk-shell-bin";
-    url = "github:rrbutani/nix-mk-shell-bin";
-    attribute = "containers";
-  };
+  requiredInputs = config.lib.getInputs [
+    {
+      name = "nix2container";
+      url = "github:nlewo/nix2container";
+      attribute = "containers";
+      follows = [ "nixpkgs" ];
+    }
+    {
+      name = "mk-shell-bin";
+      url = "github:rrbutani/nix-mk-shell-bin";
+      attribute = "containers";
+    }
+  ];
+  nix2container = requiredInputs.nix2container.packages.${pkgs.stdenv.system};
+  mk-shell-bin = requiredInputs.mk-shell-bin;
   shell = mk-shell-bin.lib.mkShellBin { drv = config.shell; nixpkgs = pkgs; };
   bash = "${pkgs.bashInteractive}/bin/bash";
   mkEntrypoint = cfg: pkgs.writeScript "entrypoint" ''
@@ -42,7 +46,20 @@ let
 
   mkHome = path: (pkgs.runCommand "devenv-container-home" { } ''
     mkdir -p $out${homeDir}
-    cp -r ${path} $out${homeDir}/
+    if [ -d ${path} ]; then
+      # Copy the directory's contents into the working directory so that, e.g.,
+      # the project root ends up directly under ${homeDir} rather than in a
+      # hash-prefixed subdirectory.
+      cp -rP ${path}/. $out${homeDir}/
+    else
+      # Copy a single file using its original name, dropping the store hash.
+      # Preserve symlinks (-P) rather than following them: paths produced by the
+      # `files` option are symlinks into the store, and their targets are not part
+      # of this source path's closure, so dereferencing would fail to stat them.
+      # Keeping the symlink lets Nix's output scan pull the target into the
+      # closure so it ends up in the image.
+      cp -P ${path} "$out${homeDir}/${baseNameOf path}"
+    fi
   '');
 
   mkMultiHome = paths: map mkHome paths;
@@ -92,7 +109,7 @@ let
     };
 
 
-  mkDerivation = cfg: nix2container.nix2container.buildImage {
+  mkDerivation = cfg: nix2container.nix2container.buildImage ({
     name = cfg.name;
     tag = cfg.version;
     initializeNixDatabase = true;
@@ -157,9 +174,11 @@ let
         then cfg.startupCommand
         else [ cfg.startupCommand ];
     };
-  };
+  } // lib.optionalAttrs (cfg.fromImage != null) {
+    fromImage = cfg.fromImage;
+  });
 
-  # <registry> <args>
+  # <container> <registry> <args>
   mkCopyScript = cfg: pkgs.writeShellScript "copy-container" ''
     set -e -o pipefail
 
@@ -167,7 +186,7 @@ let
     shift
 
     if [[ "$1" == false ]]; then
-      registry=${cfg.registry}
+      registry="${cfg.registry}"
     else
       registry="$1"
     fi
@@ -196,6 +215,12 @@ let
         default = "${projectName name}-${name}";
       };
 
+      fromImage = lib.mkOption {
+        type = types.nullOr types.package;
+        description = "An existing OCI base image to build on top of, built with nix2container's pullImage.";
+        default = null;
+      };
+
       version = lib.mkOption {
         type = types.nullOr types.str;
         description = "Version/tag of the container.";
@@ -205,7 +230,7 @@ let
       copyToRoot = lib.mkOption {
         type = types.either types.path (types.listOf types.path);
         description = "Add a path to the container. Defaults to the whole git repo.";
-        default = self;
+        default = projectRoot;
         defaultText = lib.literalExpression "self";
       };
 
@@ -383,9 +408,9 @@ let
         internal = true;
         default = pkgs.writeShellScript "docker-run" ''
           if [ -t 0 ]; then
-            docker run -it ${config.name}:${config.version} "$@"
+            ${pkgs.docker-client}/bin/docker run -it ${config.name}:${config.version} "$@"
           else
-            docker run -i ${config.name}:${config.version} "$@"
+            ${pkgs.docker-client}/bin/docker run -i ${config.name}:${config.version} "$@"
           fi
         '';
       };
@@ -411,7 +436,18 @@ in
       isBuilding = lib.mkOption {
         type = types.bool;
         default = false;
-        description = "Set to true when the environment is building a container.";
+        description = ''
+          Devenv set it to true when the environment is a container.
+
+          Example:
+          ```nix
+          { pkgs, config, lib, ... }:
+          {
+            packages = [ pkgs.openssl ]
+            ++ lib.optionals (!config.container.isBuilding) [ pkgs.git ];
+          }
+          ```
+        '';
       };
     };
   };
@@ -439,5 +475,18 @@ in
       devenv.root = lib.mkForce "${homeDir}";
       devenv.dotfile = lib.mkOverride 49 "${homeDir}/.devenv";
     })
+    {
+      tasks."devenv:container:copy" = {
+        exec = ''
+          copy_script=$(${pkgs.jq}/bin/jq -r '.copy_script' <<< "$DEVENV_TASK_INPUT")
+          spec=$(${pkgs.jq}/bin/jq -r '.spec' <<< "$DEVENV_TASK_INPUT")
+          registry=$(${pkgs.jq}/bin/jq -r '.registry' <<< "$DEVENV_TASK_INPUT")
+          readarray -t copy_args < <(${pkgs.jq}/bin/jq -r '.copy_args[]' <<< "$DEVENV_TASK_INPUT")
+
+          "$copy_script" "$spec" "$registry" "''${copy_args[@]}"
+        '';
+        showOutput = true;
+      };
+    }
   ];
 }

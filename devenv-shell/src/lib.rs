@@ -1,19 +1,22 @@
 //! Shell and PTY management for devenv.
 //!
 //! This crate provides shell session management with hot-reload support,
-//! including PTY spawning, terminal handling, status line rendering,
-//! and task execution within the shell environment.
+//! including PTY spawning, terminal handling, and status line rendering.
 
 pub mod dialect;
+pub mod escape;
+pub mod escape_state;
 mod protocol;
 mod pty;
 mod session;
 mod status_line;
-mod task_runner;
 mod terminal;
+pub mod terminal_commands;
+mod utf8_accumulator;
+pub mod vt_utils;
 
 // Protocol types
-pub use protocol::{PtyTaskRequest, PtyTaskResult, ShellCommand, ShellEvent};
+pub use protocol::{ShellCommand, ShellEvent};
 
 // PTY management
 pub use pty::{Pty, PtyError, get_terminal_size};
@@ -27,11 +30,10 @@ pub use status_line::{StatusLine, StatusState};
 // Shared UI constants (used by devenv-tui)
 pub use status_line::{
     CHECKMARK, COLOR_ACTIVE, COLOR_ACTIVE_NESTED, COLOR_COMPLETED, COLOR_FAILED, COLOR_HIERARCHY,
-    COLOR_INFO, COLOR_INTERACTIVE, COLOR_SECONDARY, SPINNER_FRAMES, SPINNER_INTERVAL_MS, XMARK,
+    COLOR_INFO, COLOR_INTERACTIVE, COLOR_SECONDARY, COLOR_TRANSIENT, DOT_HALF, DOT_INERT,
+    DOT_READY, DOT_RING, DOT_RUNNING, PULSE_INTERVAL_MS, SPINNER_FRAMES, SPINNER_INTERVAL_MS,
+    XMARK,
 };
-
-// Task execution
-pub use task_runner::{PtyTaskRunner, TaskRunnerError};
 
 // Main session
 pub use session::{SessionConfig, SessionError, SessionIo, ShellSession, TuiHandoff};

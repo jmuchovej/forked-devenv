@@ -2,6 +2,7 @@ use miette::{IntoDiagnostic, Result, WrapErr, bail};
 use pathdiff;
 use schemars::{JsonSchema, schema_for};
 use schematic::ConfigLoader;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -12,7 +13,21 @@ use std::{
 const YAML_CONFIG: &str = "devenv.yaml";
 const YAML_LOCAL_CONFIG: &str = "devenv.local.yaml";
 
+/// Version requirement for the devenv CLI.
+///
+/// - `true`: CLI version must match the modules version (checked during Nix evaluation)
+/// - A constraint string like `">=2.0.0"`: checked before Nix evaluation
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, schematic::Schematic)]
+#[serde(untagged)]
+pub enum RequireVersion {
+    /// When true, CLI version must match the modules version
+    Match(bool),
+    /// Version constraint string (e.g., ">=2.0.0", "2.0.7")
+    Constraint(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, schematic::Schematic)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum NixBackendType {
@@ -23,41 +38,138 @@ pub enum NixBackendType {
 }
 
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[config(rename_all = "camelCase")]
-#[serde(rename_all = "camelCase")]
-pub struct NixpkgsConfig {
+#[serde(rename_all = "snake_case")]
+pub struct AndroidSdkConfig {
+    /// Accept the Android SDK license.
+    /// Can also be set via the `NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1` environment variable.
+    ///
+    /// Default: `false`.
     #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
-    pub allow_unfree: bool,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
-    pub allow_broken: bool,
-    #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
-    pub cuda_support: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[setting(merge = schematic::merge::append_vec)]
-    pub cuda_capabilities: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[setting(merge = schematic::merge::append_vec)]
-    pub permitted_insecure_packages: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub permitted_unfree_packages: Vec<String>,
+    #[setting(alias = "acceptLicense", merge = schematic::merge::replace)]
+    pub accept_license: bool,
 }
 
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[config(rename_all = "camelCase")]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
+pub struct NixpkgsConfig {
+    /// Allow unfree packages.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "allowUnfree", merge = schematic::merge::replace)]
+    pub allow_unfree: bool,
+    /// Allow packages that are not supported on the current system.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 2.0.5.
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "allowUnsupportedSystem", merge = schematic::merge::replace)]
+    pub allow_unsupported_system: bool,
+    /// Allow packages marked as broken.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "allowBroken", merge = schematic::merge::replace)]
+    pub allow_broken: bool,
+    /// Allow packages not built from source.
+    ///
+    /// Default: `true` (nixpkgs default).
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "allowNonSource", merge = schematic::merge::replace)]
+    pub allow_non_source: bool,
+    /// Enable CUDA support for nixpkgs.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "cudaSupport", merge = schematic::merge::replace)]
+    pub cuda_support: bool,
+    /// Select CUDA capabilities for nixpkgs.
+    ///
+    /// Default: `[]`.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[setting(alias = "cudaCapabilities", merge = schematic::merge::append_vec)]
+    pub cuda_capabilities: Vec<String>,
+    /// Enable ROCm support for nixpkgs.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 2.0.7.
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "rocmSupport", merge = schematic::merge::replace)]
+    pub rocm_support: bool,
+    /// A list of insecure permitted packages.
+    ///
+    /// Default: `[]`.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[setting(alias = "permittedInsecurePackages", merge = schematic::merge::append_vec)]
+    pub permitted_insecure_packages: Vec<String>,
+    /// A list of unfree packages to allow by name.
+    ///
+    /// Default: `[]`.
+    ///
+    /// Added in 1.9.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    #[setting(alias = "permittedUnfreePackages")]
+    pub permitted_unfree_packages: Vec<String>,
+    /// A list of license names to allow.
+    /// Uses nixpkgs license attribute names (e.g. `gpl3Only`, `mit`, `asl20`).
+    /// See [nixpkgs license list](https://github.com/NixOS/nixpkgs/blob/master/lib/licenses.nix).
+    ///
+    /// Default: `[]`.
+    #[serde(skip_serializing, default)]
+    #[setting(alias = "allowlistedLicenses", merge = schematic::merge::append_vec)]
+    pub allowlisted_licenses: Vec<String>,
+    /// A list of license names to block.
+    /// Uses nixpkgs license attribute names (e.g. `unfree`, `bsl11`).
+    /// See [nixpkgs license list](https://github.com/NixOS/nixpkgs/blob/master/lib/licenses.nix).
+    ///
+    /// Default: `[]`.
+    #[serde(skip_serializing, default)]
+    #[setting(alias = "blocklistedLicenses", merge = schematic::merge::append_vec)]
+    pub blocklisted_licenses: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(nested)]
+    pub android_sdk: Option<AndroidSdkConfig>,
+}
+
+#[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub struct Input {
+    /// URI specification of the input.
+    /// See [Supported URI formats](../inputs.md#supported-uri-formats).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub url: Option<String>,
+    /// Does the input contain `flake.nix` or `devenv.nix`.
+    ///
+    /// Default: `true`.
     #[serde(skip_serializing_if = "is_true", default = "true_default")]
     #[setting(default = true)]
     pub flake: bool,
+    /// Another input to "inherit" from by name.
+    /// See [Following inputs](../inputs.md#following-inputs).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub follows: Option<String>,
+    /// Override nested inputs by name.
+    /// See [Following inputs](../inputs.md#following-inputs).
+    ///
+    /// Opaque.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub inputs: BTreeMap<String, Input>,
+    /// A list of overlays to include from the input.
+    /// See [Overlays](../overlays.md).
+    ///
+    /// Default: `[]`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub overlays: Vec<String>,
 }
@@ -106,99 +218,220 @@ impl TryFrom<&Input> for FlakeInput {
     }
 }
 
-fn true_default() -> bool {
-    true
-}
-#[allow(dead_code)]
-fn false_default() -> bool {
-    false
-}
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-fn is_default<T: Default + PartialEq>(t: &T) -> bool {
-    t == &T::default()
-}
-
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Clean {
+    /// Clean the environment when entering the shell.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.0.
     pub enabled: bool,
+    /// A list of environment variables to keep when cleaning the environment.
+    ///
+    /// Default: `[]`.
+    ///
+    /// Added in 1.0.
     pub keep: Vec<String>,
     // TODO: executables?
 }
 
+impl Clean {
+    /// Variables devenv requires internally and must survive env cleaning.
+    /// `_DEVENV_HOOK_DIR` marks shells spawned by `devenv hook`; the shell
+    /// hooks rely on its presence to know whether `cd`-ing out of the
+    /// project should exit the current shell.
+    const ALWAYS_KEEP: &'static [&'static str] = &["_DEVENV_HOOK_DIR"];
+
+    /// Return host environment variables filtered by the clean/keep settings.
+    ///
+    /// When `enabled`, only variables whose name appears in `keep` or
+    /// `ALWAYS_KEEP` are returned. Otherwise every host variable is returned.
+    pub fn kept_env_vars(&self) -> HashMap<String, String> {
+        let vars = std::env::vars();
+        if self.enabled {
+            let keep: HashSet<&str> = self
+                .keep
+                .iter()
+                .map(|s| s.as_str())
+                .chain(Self::ALWAYS_KEEP.iter().copied())
+                .collect();
+            vars.filter(|(key, _)| keep.contains(key.as_str()))
+                .collect()
+        } else {
+            vars.collect()
+        }
+    }
+}
+
 #[derive(schematic::Config, Clone, Serialize, Debug, JsonSchema)]
-#[config(rename_all = "camelCase", allow_unknown_fields)]
-#[serde(rename_all = "camelCase")]
+#[config(allow_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub struct Nixpkgs {
     #[serde(flatten)]
     #[setting(nested)]
     pub config_: NixpkgsConfig,
-    #[serde(
-        rename = "per-platform",
-        skip_serializing_if = "BTreeMap::is_empty",
-        default
-    )]
-    #[setting(merge = schematic::merge::merge_btreemap)]
+    /// Per-platform nixpkgs configuration.
+    /// Accepts the same options as `nixpkgs`.
+    ///
+    /// Opaque.
+    ///
+    /// Added in 1.7.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    // TODO(v3.0): remove deprecated alias
+    #[setting(alias = "per-platform", nested, merge = schematic::merge::merge_btreemap)]
     pub per_platform: BTreeMap<String, NixpkgsConfig>,
 }
 
 #[derive(schematic::Config, Clone, Serialize, Debug, JsonSchema)]
-#[config(rename_all = "camelCase", allow_unknown_fields)]
-#[serde(rename_all = "camelCase")]
+#[config(allow_unknown_fields)]
+#[serde(rename_all = "snake_case")]
 pub struct Config {
+    /// Version requirement for the devenv CLI.
+    /// Set to `true` to enforce that the CLI version matches the modules version
+    /// (from the `devenv` input), or use a constraint string with operators
+    /// (`>=`, `<=`, `>`, `<`, `=`, or a bare version for an exact match).
+    ///
+    /// Added in 2.1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(merge = schematic::merge::replace)]
+    pub require_version: Option<RequireVersion>,
+    /// Map of Nix inputs.
+    /// See [Inputs](../inputs.md).
+    ///
+    /// Default: `inputs.nixpkgs.url: github:cachix/devenv-nixpkgs/rolling`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     #[setting(nested, merge = schematic::merge::merge_btreemap)]
     pub inputs: BTreeMap<String, Input>,
+    // Deprecated top-level nixpkgs settings — deprecated since 2.0.
+    // Read inside `nixpkgs_config()` under `#[allow(deprecated)]`.
+    // TODO(v3.0): remove these fields and the `allow(deprecated)` shim.
+    #[deprecated(since = "2.0.0", note = "use `nixpkgs.allow_unfree` instead")]
     #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
+    #[setting(alias = "allowUnfree", merge = schematic::merge::replace)]
     pub allow_unfree: bool,
+    #[deprecated(
+        since = "2.0.0",
+        note = "use `nixpkgs.allow_unsupported_system` instead"
+    )]
     #[serde(skip_serializing_if = "is_false", default = "false_default")]
-    #[setting(merge = schematic::merge::replace)]
+    #[setting(alias = "allowUnsupportedSystem", merge = schematic::merge::replace)]
+    pub allow_unsupported_system: bool,
+    #[deprecated(since = "2.0.0", note = "use `nixpkgs.allow_broken` instead")]
+    #[serde(skip_serializing_if = "is_false", default = "false_default")]
+    #[setting(alias = "allowBroken", merge = schematic::merge::replace)]
     pub allow_broken: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[setting(nested)]
     pub nixpkgs: Option<Nixpkgs>,
+    /// A list of relative paths, absolute paths, or references to inputs to import `devenv.nix` and `devenv.yaml` files.
+    /// See [Composing using imports](../composing-using-imports.md).
+    ///
+    /// Default: `[]`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     #[setting(merge = schematic::merge::append_vec)]
     pub imports: Vec<String>,
+    #[deprecated(
+        since = "2.0.0",
+        note = "use `nixpkgs.permitted_insecure_packages` instead"
+    )]
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    #[setting(merge = schematic::merge::append_vec)]
+    #[setting(alias = "permittedInsecurePackages", merge = schematic::merge::append_vec)]
     pub permitted_insecure_packages: Vec<String>,
     #[setting(nested)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub clean: Option<Clean>,
+    /// Relax the hermeticity of the environment.
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.0.
     #[serde(skip_serializing_if = "is_false", default = "false_default")]
     #[setting(merge = schematic::merge::replace)]
     pub impure: bool,
+    /// Select the Nix backend used to evaluate `devenv.nix`.
+    ///
+    /// Default: `nix`.
     #[serde(default, skip_serializing_if = "is_default")]
     #[setting(merge = schematic::merge::replace)]
     pub backend: NixBackendType,
     #[setting(nested)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub secretspec: Option<SecretspecConfig>,
+    /// Default profile to activate.
+    /// Can be overridden by `--profile` CLI flag.
+    /// See [Profiles](../profiles.md).
+    ///
+    /// Added in 1.11.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     #[setting(merge = schematic::merge::replace)]
     pub profile: Option<String>,
+    /// Enable auto-reload of the shell when files change.
+    /// Can be overridden by `--reload` or `--no-reload` CLI flags.
+    ///
+    /// Default: `true`.
+    ///
+    /// Added in 2.0.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(merge = schematic::merge::replace)]
+    pub reload: Option<bool>,
+    /// Error if a port is already in use instead of auto-allocating the next available port.
+    /// Can be overridden by `--strict-ports` or `--no-strict-ports` CLI flags.
+    ///
+    /// Default: `false`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(alias = "strictPorts", merge = schematic::merge::replace)]
+    pub strict_ports: Option<bool>,
+    /// Default interactive shell to use when entering the devenv environment.
+    /// Can be overridden by the `--shell` CLI flag.
+    /// Falls back to the `$SHELL` environment variable, then `bash`.
+    ///
+    /// Supported values: `bash`, `zsh`, `fish`, `nu`. Any other value falls back to `bash`.
+    ///
+    /// Default: `$SHELL` or `bash`.
+    ///
+    /// Added in 2.1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[setting(merge = schematic::merge::replace)]
+    pub shell: Option<String>,
     /// Git repository root path (not serialized, computed during load)
     #[serde(skip)]
     pub git_root: Option<PathBuf>,
 }
 
 #[derive(schematic::Config, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub struct SecretspecConfig {
+    /// Enable [secretspec integration](../integrations/secretspec.md).
+    ///
+    /// Default: `false`.
+    ///
+    /// Added in 1.8.
     #[serde(skip_serializing_if = "is_false", default = "false_default")]
     #[setting(default = false)]
     pub enable: bool,
+    /// Secretspec profile name to use.
+    ///
+    /// Added in 1.8.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub profile: Option<String>,
+    /// Secretspec provider to use.
+    ///
+    /// Added in 1.8.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub provider: Option<String>,
+    /// Name of the secretspec secret to read the Cachix auth token from
+    /// when `CACHIX_AUTH_TOKEN` is not set in the environment.
+    ///
+    /// This is the secret name declared in `secretspec.toml`, not the
+    /// token value. Use this when your secretspec backend (e.g. an
+    /// OpenBao/Vault policy) only grants access to a secret under a name
+    /// other than the default `CACHIX_AUTH_TOKEN`.
+    ///
+    /// Default: `CACHIX_AUTH_TOKEN`.
+    ///
+    /// Added in 2.1.3.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cachix_auth_token: Option<String>,
 }
 
 // TODO: https://github.com/moonrepo/schematic/issues/105
@@ -213,6 +446,381 @@ pub async fn write_json_schema() -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("Failed to write json schema to {}", path.display()))?;
     Ok(())
+}
+
+pub async fn write_yaml_options_doc() -> Result<()> {
+    let schema = schema_for!(Config);
+    let json: serde_json::Value = serde_json::to_value(&schema)
+        .into_diagnostic()
+        .wrap_err("Failed to serialize JSON schema")?;
+    let rendered = render_yaml_options(&json);
+    let path = Path::new("docs/src/reference/yaml-options.md");
+    tokio::fs::write(path, &rendered)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("Failed to write yaml-options to {}", path.display()))?;
+    Ok(())
+}
+
+struct OptionSection {
+    path: String,
+    description: String,
+    added_in: Option<String>,
+    default: Option<String>,
+    type_label: String,
+}
+
+struct ParsedMeta {
+    body: String,
+    added_in: Option<String>,
+    default: Option<String>,
+    opaque: bool,
+}
+
+fn render_yaml_options(schema: &serde_json::Value) -> String {
+    let defs = schema
+        .get("$defs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let properties = schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut sections: Vec<OptionSection> = Vec::new();
+    let visited: HashSet<String> = HashSet::new();
+    for (name, prop) in properties.iter() {
+        collect_sections(name, prop, &defs, &visited, &mut sections);
+    }
+    sections.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out = String::from("# devenv.yaml\n\n");
+    out.push_str("<!-- This file is auto-generated from devenv-core/src/config.rs doc comments. Do not edit. -->\n\n");
+    for section in sections {
+        out.push_str(&render_section(&section));
+    }
+    out
+}
+
+/// Extract the `$ref` target name from a schema, considering direct `$ref` and `anyOf` wrappers.
+fn ref_target(schema: &serde_json::Value) -> Option<String> {
+    if let Some(r) = schema.get("$ref").and_then(|v| v.as_str())
+        && let Some(name) = r.strip_prefix("#/$defs/")
+    {
+        return Some(name.to_string());
+    }
+    if let Some(any) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        let non_null: Vec<&serde_json::Value> = any
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"))
+            .collect();
+        if non_null.len() == 1 {
+            return ref_target(non_null[0]);
+        }
+    }
+    None
+}
+
+fn collect_sections(
+    path: &str,
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    visited: &HashSet<String>,
+    out: &mut Vec<OptionSection>,
+) {
+    if schema.get("deprecated").and_then(|v| v.as_bool()) == Some(true) {
+        return;
+    }
+
+    let resolved = resolve_ref(schema, defs);
+    let description = description_of(schema).unwrap_or_default();
+    let opaque = parse_description(&description).opaque;
+
+    // Map types (BTreeMap<String, T>) -> emit "<path>.<name>.<sub>" sections via additionalProperties.
+    if let Some(additional) = resolved.get("additionalProperties") {
+        let wildcard_path = format!("{}.\\<name\\>", path);
+        let inner_ref = ref_target(additional);
+        let cycle = inner_ref
+            .as_ref()
+            .map(|name| visited.contains(name))
+            .unwrap_or(false);
+        let inner_resolved = resolve_ref(additional, defs);
+
+        if !opaque
+            && !cycle
+            && inner_resolved
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .is_some()
+        {
+            if !description.is_empty() {
+                out.push(make_section(
+                    path,
+                    &type_label(&resolved, defs),
+                    description,
+                ));
+            }
+            let mut next = visited.clone();
+            if let Some(name) = inner_ref {
+                next.insert(name);
+            }
+            if let Some(props) = inner_resolved.get("properties").and_then(|v| v.as_object()) {
+                for (name, sub) in props {
+                    collect_sections(
+                        &format!("{}.{}", wildcard_path, name),
+                        sub,
+                        defs,
+                        &next,
+                        out,
+                    );
+                }
+            }
+            return;
+        }
+        // Cycle, opaque, scalar value type, or no struct properties -> single section.
+        out.push(make_section(
+            path,
+            &type_label(&resolved, defs),
+            description,
+        ));
+        return;
+    }
+
+    // Object with properties (via $ref or inline) -> recurse.
+    let inline_ref = ref_target(schema);
+    let cycle = inline_ref
+        .as_ref()
+        .map(|name| visited.contains(name))
+        .unwrap_or(false);
+    if !opaque
+        && !cycle
+        && let Some(props) = resolved.get("properties").and_then(|v| v.as_object())
+    {
+        if !description.is_empty() {
+            out.push(make_section(
+                path,
+                &type_label(&resolved, defs),
+                description,
+            ));
+        }
+        let mut next = visited.clone();
+        if let Some(name) = inline_ref {
+            next.insert(name);
+        }
+        for (name, sub) in props {
+            collect_sections(&format!("{}.{}", path, name), sub, defs, &next, out);
+        }
+        return;
+    }
+
+    // Leaf scalar / enum / cycle / opaque.
+    let desc = if description.is_empty() {
+        description_of(&resolved).unwrap_or_default()
+    } else {
+        description
+    };
+    out.push(make_section(path, &type_label(&resolved, defs), desc));
+}
+
+fn make_section(path: &str, type_label: &str, raw_description: String) -> OptionSection {
+    let meta = parse_description(&raw_description);
+    OptionSection {
+        path: path.to_string(),
+        description: meta.body,
+        added_in: meta.added_in,
+        default: meta.default,
+        type_label: type_label.to_string(),
+    }
+}
+
+fn parse_description(input: &str) -> ParsedMeta {
+    let mut lines: Vec<String> = input.lines().map(|l| l.to_string()).collect();
+    let mut added_in: Option<String> = None;
+    let mut default: Option<String> = None;
+    let mut opaque = false;
+    // Walk lines from the end, pulling off trailing metadata markers.
+    while let Some(last) = lines.last().cloned() {
+        let trimmed = last.trim();
+        if trimmed.is_empty() {
+            lines.pop();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Added in ") {
+            added_in = Some(rest.trim_end_matches('.').to_string());
+            lines.pop();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Default: ") {
+            default = Some(rest.trim_end_matches('.').to_string());
+            lines.pop();
+            continue;
+        }
+        if trimmed == "Opaque." {
+            opaque = true;
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    ParsedMeta {
+        body: lines.join("\n").trim().to_string(),
+        added_in,
+        default,
+        opaque,
+    }
+}
+
+fn render_section(s: &OptionSection) -> String {
+    let mut out = format!("## {}\n\n", s.path);
+    if !s.description.is_empty() {
+        out.push_str(&s.description);
+        out.push_str("\n\n");
+    }
+    let mut meta = vec![format!("*Type:* {}", s.type_label)];
+    if let Some(default) = &s.default {
+        meta.push(format!("*Default:* {}", default));
+    }
+    out.push_str(&meta.join(" · "));
+    out.push('\n');
+    if let Some(version) = &s.added_in {
+        out.push_str(&format!("\n!!! tip \"New in version {}\"\n", version));
+    }
+    out.push('\n');
+    out
+}
+
+fn description_of(schema: &serde_json::Value) -> Option<String> {
+    schema
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn resolve_ref(
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    // Direct $ref
+    if let Some(reference) = schema.get("$ref").and_then(|v| v.as_str())
+        && let Some(name) = reference.strip_prefix("#/$defs/")
+        && let Some(target) = defs.get(name)
+    {
+        return target.clone();
+    }
+    // anyOf with one $ref + null -> resolve the $ref.
+    if let Some(any) = schema.get("anyOf").and_then(|v| v.as_array()) {
+        let non_null: Vec<&serde_json::Value> = any
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"))
+            .collect();
+        if non_null.len() == 1 {
+            return resolve_ref(non_null[0], defs);
+        }
+    }
+    schema.clone()
+}
+
+/// Returns a markdown-ready type expression including outer backticks.
+fn type_label(
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    format!("`{}`", type_label_inner(schema, defs))
+}
+
+fn type_label_inner(
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let ref_name = ref_target(schema);
+    let resolved = resolve_ref(schema, defs);
+
+    if let Some(enum_values) = resolved.get("enum").and_then(|v| v.as_array()) {
+        let values: Vec<String> = enum_values
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        return values.join(" | ");
+    }
+
+    if let Some(any) = resolved.get("anyOf").and_then(|v| v.as_array()) {
+        let parts: Vec<String> = any
+            .iter()
+            .filter(|v| v.get("type").and_then(|t| t.as_str()) != Some("null"))
+            .map(|v| type_label_inner(v, defs))
+            .collect();
+        if !parts.is_empty() {
+            return parts.join(" | ");
+        }
+    }
+
+    if let Some(types) = resolved.get("type").and_then(|v| v.as_array()) {
+        let non_null: Vec<&str> = types
+            .iter()
+            .filter_map(|t| t.as_str())
+            .filter(|s| *s != "null")
+            .collect();
+        if non_null.len() == 1 {
+            return scalar_label_inner(non_null[0], &resolved, defs, ref_name.as_deref());
+        }
+    }
+
+    if let Some(ty) = resolved.get("type").and_then(|v| v.as_str()) {
+        return scalar_label_inner(ty, &resolved, defs, ref_name.as_deref());
+    }
+
+    ref_name.unwrap_or_else(|| "unknown".to_string())
+}
+
+fn scalar_label_inner(
+    ty: &str,
+    schema: &serde_json::Value,
+    defs: &serde_json::Map<String, serde_json::Value>,
+    ref_name: Option<&str>,
+) -> String {
+    match ty {
+        "boolean" => "boolean".to_string(),
+        "string" => "string".to_string(),
+        "integer" => "integer".to_string(),
+        "number" => "number".to_string(),
+        "array" => {
+            let item_label = schema
+                .get("items")
+                .map(|i| type_label_inner(i, defs))
+                .unwrap_or_else(|| "any".to_string());
+            format!("list of {}", item_label)
+        }
+        "object" => {
+            if let Some(additional) = schema.get("additionalProperties") {
+                let inner_ref = ref_target(additional);
+                let inner = inner_ref
+                    .map(|n| humanize_ref_name(&n))
+                    .unwrap_or_else(|| type_label_inner(additional, defs));
+                format!("attribute set of {}", inner)
+            } else if let Some(name) = ref_name {
+                humanize_ref_name(name)
+            } else {
+                "attribute set".to_string()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `NixpkgsConfig` -> `nixpkgs config`, `Input` -> `input`.
+fn humanize_ref_name(name: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if i > 0 && ch.is_uppercase() {
+            out.push(' ');
+        }
+        for low in ch.to_lowercase() {
+            out.push(low);
+        }
+    }
+    out
 }
 
 impl From<&Path> for Config {
@@ -257,8 +865,10 @@ impl Config {
         let base_path = path.as_ref();
         let base_yaml = base_path.join(YAML_CONFIG);
 
-        // Collect all yaml files to load (base + imports)
-        let mut yaml_files = Vec::new();
+        // Collect imported yaml files only (not the base). These are merged
+        // first, with the base loaded after them so base definitions take
+        // precedence over imports.
+        let mut imported_yamls = Vec::new();
         let mut visited = HashSet::new();
 
         if base_yaml.exists() {
@@ -269,7 +879,6 @@ impl Config {
                     .wrap_err_with(|| {
                         format!("Failed to canonicalize base path: {}", base_yaml.display())
                     })?;
-            yaml_files.push(base_yaml.clone());
             visited.insert(canonical_base);
         }
 
@@ -291,22 +900,27 @@ impl Config {
         // Detect git repository root for import resolution
         let git_root = Self::detect_git_root(base_path);
 
-        // Recursively collect all imported yaml files
+        // Recursively collect imported yaml files (loaded first, lowest priority)
         Self::collect_import_files(
             &temp_result.config.imports,
             base_path,
             git_root.as_deref(),
-            &mut yaml_files,
+            &mut imported_yamls,
             &mut visited,
             0,
         )?;
 
-        // Load all configs and track which inputs come from which config file
-        // This is needed to correctly normalize relative URLs
+        // Load imports first, then base last so base takes precedence.
+        let load_order = imported_yamls
+            .iter()
+            .chain(base_yaml.exists().then_some(&base_yaml));
+
+        // Load all configs and track which inputs come from which config file.
+        // This is needed to correctly normalize relative URLs.
         let mut loader = ConfigLoader::<Config>::new();
         let mut input_source_dirs: HashMap<String, PathBuf> = HashMap::new();
 
-        for yaml_file in &yaml_files {
+        for yaml_file in load_order {
             let config_dir = yaml_file.parent().unwrap_or(Path::new(".")).to_path_buf();
 
             // Load this config file to see what inputs it defines
@@ -324,12 +938,10 @@ impl Config {
                 )
             })?;
 
-            // Record the source directory for each input defined in this config
-            // Earlier configs take precedence (first definition wins)
+            // Record the source directory for each input defined in this config.
+            // Later configs take precedence (base overrides imports).
             for input_name in single_result.config.inputs.keys() {
-                input_source_dirs
-                    .entry(input_name.clone())
-                    .or_insert_with(|| config_dir.clone());
+                input_source_dirs.insert(input_name.clone(), config_dir.clone());
             }
 
             loader
@@ -445,8 +1057,8 @@ impl Config {
         let mut final_imports = Vec::new();
         let mut seen = HashSet::new();
 
-        // Add all loaded file imports (normalized)
-        for yaml_path in yaml_files.iter().skip(1) {
+        // Add all loaded file imports (normalized).
+        for yaml_path in &imported_yamls {
             if let Some(import_dir) = yaml_path.parent()
                 && let Some(normalized) = Self::normalize_path(import_dir, base_path)
                 && seen.insert(normalized.clone())
@@ -486,6 +1098,62 @@ impl Config {
         config.git_root = git_root;
 
         Ok(config)
+    }
+
+    /// Check that `current` (e.g. "2.0.7") satisfies the version requirement in
+    /// `devenv.yaml`. No-op when no requirement is set or when `require_version: true`
+    /// (deferred to Nix evaluation where the modules version is available).
+    pub fn check_version(&self, current: &str) -> Result<()> {
+        let constraint = match &self.require_version {
+            // Match(_) is either disabled (false) or deferred to Nix eval (true)
+            None | Some(RequireVersion::Match(_)) => return Ok(()),
+            Some(RequireVersion::Constraint(c)) => c,
+        };
+
+        // Bare version "2.0.7" means exact match; semver crate treats it as "^2.0.7"
+        let req_str = if constraint.starts_with('>')
+            || constraint.starts_with('<')
+            || constraint.starts_with('=')
+        {
+            constraint.clone()
+        } else {
+            format!("={constraint}")
+        };
+
+        let cur = Self::parse_version(current)
+            .wrap_err_with(|| format!("Failed to parse current devenv version '{current}'"))?;
+        let req = VersionReq::parse(&req_str)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("Failed to parse version constraint '{constraint}' in devenv.yaml")
+            })?;
+
+        if !req.matches(&cur) {
+            bail!(
+                "devenv version {current} does not satisfy the constraint '{constraint}' in devenv.yaml"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns true when `require_version: true` is set, meaning the Nix modules
+    /// should assert that CLI version matches the modules version.
+    pub fn requires_version_match(&self) -> bool {
+        matches!(&self.require_version, Some(RequireVersion::Match(true)))
+    }
+
+    /// Parse a version string, accepting "X.Y" (appending ".0") and "X.Y.Z".
+    fn parse_version(s: &str) -> Result<Version> {
+        // semver crate requires X.Y.Z; support X.Y by appending .0
+        let normalized = if s.matches('.').count() == 1 {
+            format!("{s}.0")
+        } else {
+            s.to_string()
+        };
+        Version::parse(&normalized)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("expected version format X.Y or X.Y.Z, got '{s}'"))
     }
 
     /// Detects the git repository root starting from the given path.
@@ -576,19 +1244,24 @@ impl Config {
         } else if canonical_import.is_none()
             && let Some(canonical_root) = canonical_root
         {
-            // Import path doesn't exist, but root does - validate lexically
-            // First make the import path absolute, then normalize
-            let abs_import = if import_path.is_absolute() {
-                Self::normalize_path_components(import_path)
-            } else {
-                // Make relative path absolute from current directory first
-                if let Ok(cwd) = std::env::current_dir() {
-                    let absolute = cwd.join(import_path);
-                    Self::normalize_path_components(&absolute)
+            // Import path doesn't exist, but root does.
+            // Canonicalize the parent directory to resolve symlinks
+            // (e.g. /tmp -> /run/user/...), falling back to lexical
+            // normalization only when the parent doesn't exist either.
+            let abs_import = if let Some(parent) = import_path.parent() {
+                if let Ok(canonical_parent) = parent.canonicalize() {
+                    canonical_parent.join(import_path.file_name().unwrap_or_default())
+                } else if import_path.is_absolute() {
+                    Self::normalize_path_components(import_path)
+                } else if let Ok(cwd) = std::env::current_dir() {
+                    Self::normalize_path_components(&cwd.join(import_path))
                 } else {
-                    // Can't get cwd, skip validation
                     return Ok(());
                 }
+            } else if import_path.is_absolute() {
+                Self::normalize_path_components(import_path)
+            } else {
+                return Ok(());
             };
 
             if !abs_import.starts_with(&canonical_root) {
@@ -769,12 +1442,22 @@ impl Config {
         Ok(())
     }
 
-    pub async fn write(&self) -> Result<()> {
+    pub fn write(&self) -> Result<()> {
+        let root_dir = std::env::current_dir()
+            .into_diagnostic()
+            .wrap_err("Failed to get current directory")?;
+        self.write_to(&root_dir)
+    }
+
+    fn write_to(&self, root_dir: &Path) -> Result<()> {
         let yaml = serde_yaml::to_string(&self)
             .into_diagnostic()
             .wrap_err("Failed to serialize config to YAML")?;
-        tokio::fs::write(YAML_CONFIG, yaml)
-            .await
+        let content = format!(
+            "# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json\n{}",
+            yaml
+        );
+        std::fs::write(root_dir.join(YAML_CONFIG), content)
             .into_diagnostic()
             .wrap_err("Failed to write devenv.yaml")?;
         Ok(())
@@ -826,76 +1509,110 @@ impl Config {
 
     /// Returns the merged nixpkgs configuration for a given system.
     ///
-    /// Merges configuration with the following priority (highest to lowest):
-    /// 1. `nixpkgs.per_platform.{system}.{field}`
-    /// 2. `nixpkgs.{field}` (base nixpkgs config)
-    /// 3. Top-level `{field}` (for allow_unfree, allow_broken, permitted_insecure_packages)
-    /// 4. Default value
+    /// Layers (lowest to highest priority):
+    /// 1. Deprecated top-level fields (`allow_unfree`, etc.).
+    /// 2. `nixpkgs.<field>`.
+    /// 3. `nixpkgs.per_platform.<system>.<field>`.
     ///
-    /// This matches the logic in bootstrapLib.nix's getPlatformConfig helper.
+    /// Merging uses schematic's `#[setting(merge)]` strategies declared on
+    /// `NixpkgsConfig` — same policy as the import-time merge in
+    /// `ConfigLoader`. `Vec` fields accumulate via `append_vec`, scalars use
+    /// `replace`. No special platform-only semantics.
     pub fn nixpkgs_config(&self, system: &str) -> NixpkgsConfig {
-        // Start with defaults
-        let mut config = NixpkgsConfig::default();
+        use schematic::{Config as _, PartialConfig as _};
 
-        // Apply top-level settings (lowest priority for these fields)
-        config.allow_unfree = self.allow_unfree;
-        config.allow_broken = self.allow_broken;
-        config.permitted_insecure_packages = self.permitted_insecure_packages.clone();
+        // Layer 1: deprecated top-level fields.
+        #[allow(deprecated)]
+        let mut partial = PartialNixpkgsConfig {
+            allow_unfree: Some(self.allow_unfree),
+            allow_unsupported_system: Some(self.allow_unsupported_system),
+            allow_broken: Some(self.allow_broken),
+            permitted_insecure_packages: Some(self.permitted_insecure_packages.clone()),
+            ..Default::default()
+        };
 
-        // Apply base nixpkgs config (overrides top-level)
-        if let Some(ref nixpkgs) = self.nixpkgs {
-            let base = &nixpkgs.config_;
-            if base.allow_unfree {
-                config.allow_unfree = true;
-            }
-            if base.allow_broken {
-                config.allow_broken = true;
-            }
-            if base.cuda_support {
-                config.cuda_support = true;
-            }
-            if !base.cuda_capabilities.is_empty() {
-                config.cuda_capabilities = base.cuda_capabilities.clone();
-            }
-            if !base.permitted_insecure_packages.is_empty() {
-                config.permitted_insecure_packages = base.permitted_insecure_packages.clone();
-            }
-            if !base.permitted_unfree_packages.is_empty() {
-                config.permitted_unfree_packages = base.permitted_unfree_packages.clone();
-            }
-
-            // Apply per-platform config (highest priority)
-            if let Some(platform_config) = nixpkgs.per_platform.get(system) {
-                if platform_config.allow_unfree {
-                    config.allow_unfree = true;
-                }
-                if platform_config.allow_broken {
-                    config.allow_broken = true;
-                }
-                if platform_config.cuda_support {
-                    config.cuda_support = true;
-                }
-                if !platform_config.cuda_capabilities.is_empty() {
-                    config.cuda_capabilities = platform_config.cuda_capabilities.clone();
-                }
-                if !platform_config.permitted_insecure_packages.is_empty() {
-                    config.permitted_insecure_packages =
-                        platform_config.permitted_insecure_packages.clone();
-                }
-                if !platform_config.permitted_unfree_packages.is_empty() {
-                    config.permitted_unfree_packages =
-                        platform_config.permitted_unfree_packages.clone();
-                }
+        if let Some(nixpkgs) = &self.nixpkgs {
+            // Layer 2: `nixpkgs.<field>`.
+            partial
+                .merge(&(), nixpkgs_to_partial(&nixpkgs.config_))
+                .expect("merge base nixpkgs config");
+            // Layer 3: `nixpkgs.per_platform.<system>.<field>`.
+            if let Some(platform) = nixpkgs.per_platform.get(system) {
+                partial
+                    .merge(&(), nixpkgs_to_partial(platform))
+                    .expect("merge per-platform nixpkgs config");
             }
         }
 
-        config
+        NixpkgsConfig::from_partial(
+            partial
+                .finalize(&())
+                .expect("finalize nixpkgs partial config"),
+        )
     }
+}
+
+/// Project a [`NixpkgsConfig`] into its schematic Partial form so it can be
+/// merged via [`schematic::PartialConfig::merge`].
+fn nixpkgs_to_partial(c: &NixpkgsConfig) -> PartialNixpkgsConfig {
+    // Destructure so adding a field forces an update here.
+    let NixpkgsConfig {
+        allow_unfree,
+        allow_unsupported_system,
+        allow_broken,
+        allow_non_source,
+        cuda_support,
+        cuda_capabilities,
+        rocm_support,
+        permitted_insecure_packages,
+        permitted_unfree_packages,
+        allowlisted_licenses,
+        blocklisted_licenses,
+        android_sdk,
+    } = c.clone();
+    PartialNixpkgsConfig {
+        allow_unfree: Some(allow_unfree),
+        allow_unsupported_system: Some(allow_unsupported_system),
+        allow_broken: Some(allow_broken),
+        allow_non_source: Some(allow_non_source),
+        cuda_support: Some(cuda_support),
+        cuda_capabilities: Some(cuda_capabilities),
+        rocm_support: Some(rocm_support),
+        permitted_insecure_packages: Some(permitted_insecure_packages),
+        permitted_unfree_packages: Some(permitted_unfree_packages),
+        allowlisted_licenses: Some(allowlisted_licenses),
+        blocklisted_licenses: Some(blocklisted_licenses),
+        android_sdk: android_sdk.map(|sdk| PartialAndroidSdkConfig {
+            accept_license: Some(sdk.accept_license),
+        }),
+    }
+}
+
+// Clap helpers
+
+fn true_default() -> bool {
+    true
+}
+
+fn false_default() -> bool {
+    false
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    t == &T::default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn invalid_flake_input_from_input_with_url_and_follows() {
@@ -942,7 +1659,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Input other does not exist so it can't be followed.")]
     fn add_input_with_missing_follows() {
         let mut config = Config::default();
         let result = config.add_input(
@@ -950,7 +1666,12 @@ mod tests {
             "github:org/repo",
             &["other".to_string()],
         );
-        result.unwrap(); // This will panic with the Err from add_input
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Input other does not exist so it can't be followed."),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1043,6 +1764,40 @@ mod tests {
     }
 
     #[test]
+    fn strict_ports_field_none_by_default() {
+        let config = Config::default();
+        assert_eq!(config.strict_ports, None);
+    }
+
+    #[test]
+    fn strict_ports_field_serializes_as_snake_case() {
+        let mut config = Config::default();
+        config.strict_ports = Some(true);
+
+        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        assert!(yaml.contains("strict_ports: true"));
+    }
+
+    #[test]
+    fn strict_ports_field_not_serialized_when_none() {
+        let config = Config::default();
+        let yaml = serde_yaml::to_string(&config).expect("Failed to serialize config");
+        assert!(!yaml.contains("strict_ports"));
+    }
+
+    #[test]
+    fn strict_ports_field_respects_replace_merge_strategy() {
+        let mut config1 = Config::default();
+        config1.strict_ports = Some(false);
+
+        let mut config2 = Config::default();
+        config2.strict_ports = Some(true);
+
+        let merged_strict_ports = config2.strict_ports.or(config1.strict_ports);
+        assert_eq!(merged_strict_ports, Some(true));
+    }
+
+    #[test]
     fn relative_path_url_resolved_from_correct_config_directory() {
         // Test that when a base config and imported config both define inputs
         // with relative path URLs like "path:.", each is resolved relative
@@ -1052,7 +1807,7 @@ mod tests {
 
         // Create subdirectory for import
         let subdir = base_path.join("subproject");
-        std::fs::create_dir(&subdir).expect("Failed to create subdir");
+        fs::create_dir(&subdir).expect("Failed to create subdir");
 
         // Base config defines an input with path:.
         let base_config = r#"
@@ -1062,8 +1817,7 @@ inputs:
 imports:
   - ./subproject
 "#;
-        std::fs::write(base_path.join("devenv.yaml"), base_config)
-            .expect("Failed to write base config");
+        fs::write(base_path.join("devenv.yaml"), base_config).expect("Failed to write base config");
 
         // Subproject config defines a different input with path:.
         // This should resolve to ./subproject, not confuse with base path
@@ -1072,7 +1826,7 @@ inputs:
   sub-local:
     url: path:.
 "#;
-        std::fs::write(subdir.join("devenv.yaml"), sub_config).expect("Failed to write sub config");
+        fs::write(subdir.join("devenv.yaml"), sub_config).expect("Failed to write sub config");
 
         // Load the merged config
         let config = Config::load_from(base_path).expect("Failed to load config");
@@ -1107,11 +1861,11 @@ inputs:
 
         // Create the project directory
         let project_dir = base_path.join("project");
-        std::fs::create_dir(&project_dir).expect("Failed to create project dir");
+        fs::create_dir(&project_dir).expect("Failed to create project dir");
 
         // Create an external directory (sibling, not inside project)
         let external_dir = base_path.join("external");
-        std::fs::create_dir(&external_dir).expect("Failed to create external dir");
+        fs::create_dir(&external_dir).expect("Failed to create external dir");
 
         // Get the absolute path to the external directory
         let external_abs = external_dir
@@ -1128,7 +1882,7 @@ inputs:
 "#,
             external_abs.display()
         );
-        std::fs::write(project_dir.join("devenv.yaml"), &config_content)
+        fs::write(project_dir.join("devenv.yaml"), &config_content)
             .expect("Failed to write config");
 
         // Load the config
@@ -1151,6 +1905,378 @@ inputs:
             !url.contains("../"),
             "Should not be converted to relative path with ../, got: {}",
             url
+        );
+    }
+
+    #[test]
+    fn imported_config_does_not_override_base_inputs() {
+        // When a sub project imports a shared config and both define the same
+        // input, the sub project's (base) definition should take precedence.
+        // Regression test for https://github.com/cachix/devenv/issues/2728
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        // Initialize a git repo so import security checks pass
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .expect("Failed to git init");
+
+        // Shared config defines nixpkgs with the default URL
+        let shared_dir = root.join("shared");
+        fs::create_dir(&shared_dir).expect("Failed to create shared dir");
+        fs::write(
+            shared_dir.join("devenv.yaml"),
+            r#"
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+"#,
+        )
+        .expect("Failed to write shared config");
+
+        // Sub project imports shared and overrides nixpkgs
+        let sub_dir = root.join("sub");
+        fs::create_dir(&sub_dir).expect("Failed to create sub dir");
+        fs::write(
+            sub_dir.join("devenv.yaml"),
+            r#"
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-25.11
+
+imports:
+  - ../shared
+"#,
+        )
+        .expect("Failed to write sub config");
+
+        let config = Config::load_from(&sub_dir).expect("Failed to load config");
+
+        let nixpkgs = config.inputs.get("nixpkgs").expect("nixpkgs not found");
+        assert_eq!(
+            nixpkgs.url,
+            Some("github:NixOS/nixpkgs/nixos-25.11".to_string()),
+            "Base config's nixpkgs URL should take precedence over imported config's URL"
+        );
+    }
+
+    #[test]
+    fn sub_import_with_yaml_does_not_duplicate_base_import() {
+        // When a sub project imports and has a devenv.yaml (even empty),
+        // the base directory should NOT end up in the imports list.
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .expect("Failed to git init");
+
+        let sub_dir = root.join("sub");
+        fs::create_dir(&sub_dir).expect("Failed to create sub dir");
+        fs::write(sub_dir.join("devenv.yaml"), "").expect("Failed to write sub yaml");
+
+        fs::write(
+            root.join("devenv.yaml"),
+            r#"
+imports:
+  - ./sub
+"#,
+        )
+        .expect("Failed to write base yaml");
+
+        let config = Config::load_from(root).expect("Failed to load config");
+
+        assert!(
+            !config
+                .imports
+                .iter()
+                .any(|i| i == "./" || i == "." || i == "./."),
+            "Base directory should not appear in final_imports, got: {:?}",
+            config.imports
+        );
+    }
+
+    #[test]
+    fn check_version_none_always_passes() {
+        let config = Config::default();
+        assert!(config.check_version("2.0.7").is_ok());
+    }
+
+    #[test]
+    fn check_version_false_always_passes() {
+        let config = Config {
+            require_version: Some(RequireVersion::Match(false)),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+    }
+
+    #[test]
+    fn check_version_true_deferred_to_nix() {
+        let config = Config {
+            require_version: Some(RequireVersion::Match(true)),
+            ..Default::default()
+        };
+        // `true` is checked during Nix evaluation, so Rust check always passes
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.requires_version_match());
+    }
+
+    #[test]
+    fn check_version_exact_match() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint("2.0.7".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("2.0.8").is_err());
+    }
+
+    #[test]
+    fn check_version_gte() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.0").is_ok());
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("3.0.0").is_ok());
+        assert!(config.check_version("1.9.9").is_err());
+    }
+
+    #[test]
+    fn check_version_lt() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint("<3.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_ok());
+        assert!(config.check_version("3.0.0").is_err());
+    }
+
+    #[test]
+    fn check_version_two_component() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.1".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.1.0").is_ok());
+        assert!(config.check_version("2.1.5").is_ok());
+        assert!(config.check_version("2.0.9").is_err());
+    }
+
+    #[test]
+    fn check_version_invalid_constraint() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=abc".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("2.0.7").is_err());
+    }
+
+    #[test]
+    fn check_version_invalid_current() {
+        let config = Config {
+            require_version: Some(RequireVersion::Constraint(">=2.0.0".to_string())),
+            ..Default::default()
+        };
+        assert!(config.check_version("not-a-version").is_err());
+    }
+
+    #[test]
+    fn require_version_yaml_bool() {
+        let yaml = "require_version: true\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        assert_eq!(rv, RequireVersion::Match(true));
+    }
+
+    #[test]
+    fn require_version_yaml_string() {
+        let yaml = "require_version: \">=2.0.0\"\n";
+        let parsed: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let rv: RequireVersion = serde_yaml::from_value(parsed["require_version"].clone()).unwrap();
+        assert_eq!(rv, RequireVersion::Constraint(">=2.0.0".to_string()));
+    }
+
+    fn load_yaml(yaml: &str) -> Config {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        fs::write(temp_dir.path().join("devenv.yaml"), yaml).expect("Failed to write devenv.yaml");
+        Config::load_from(temp_dir.path()).expect("Failed to load config")
+    }
+
+    const SNAKE_CASE_INPUT: &str = r#"
+allow_unfree: true
+allow_broken: true
+allow_unsupported_system: true
+permitted_insecure_packages: ["pkg1"]
+strict_ports: true
+nixpkgs:
+  cuda_support: true
+  cuda_capabilities: ["8.0"]
+  rocm_support: true
+  allow_non_source: true
+  permitted_unfree_packages: ["terraform"]
+  allowlisted_licenses: ["mit"]
+  blocklisted_licenses: ["unfree"]
+  android_sdk:
+    accept_license: true
+  per_platform:
+    x86_64-linux:
+      allow_broken: true
+"#;
+
+    const CAMELCASE_INPUT: &str = r#"
+allowUnfree: true
+allowBroken: true
+allowUnsupportedSystem: true
+permittedInsecurePackages: ["pkg1"]
+strictPorts: true
+nixpkgs:
+  cudaSupport: true
+  cudaCapabilities: ["8.0"]
+  rocmSupport: true
+  allowNonSource: true
+  permittedUnfreePackages: ["terraform"]
+  allowlistedLicenses: ["mit"]
+  blocklistedLicenses: ["unfree"]
+  android_sdk:
+    acceptLicense: true
+  per-platform:
+    x86_64-linux:
+      allowBroken: true
+"#;
+
+    // devenv.yaml input contract: snake_case parses, serializes pure snake_case.
+    #[test]
+    fn devenv_yaml_snake_case_parses() {
+        let cfg = load_yaml(SNAKE_CASE_INPUT);
+        let expected: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+allow_unfree: true
+allow_unsupported_system: true
+allow_broken: true
+nixpkgs:
+  allow_non_source: true
+  cuda_support: true
+  cuda_capabilities: ["8.0"]
+  rocm_support: true
+  permitted_unfree_packages: ["terraform"]
+  android_sdk:
+    accept_license: true
+  per_platform:
+    x86_64-linux:
+      allow_broken: true
+permitted_insecure_packages: ["pkg1"]
+strict_ports: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(serde_yaml::to_value(&cfg).unwrap(), expected);
+
+        // skip_serializing fields don't appear in Value; check directly.
+        let nixpkgs = cfg.nixpkgs.unwrap();
+        assert_eq!(nixpkgs.config_.allowlisted_licenses, vec!["mit"]);
+        assert_eq!(nixpkgs.config_.blocklisted_licenses, vec!["unfree"]);
+    }
+
+    // devenv.yaml input contract: camelCase aliases load equivalently to snake_case.
+    // TODO(v3.0): remove together with the camelCase aliases.
+    #[test]
+    fn devenv_yaml_camelcase_aliases_back_compat() {
+        let snake = load_yaml(SNAKE_CASE_INPUT);
+        let camel = load_yaml(CAMELCASE_INPUT);
+        assert_eq!(
+            serde_yaml::to_value(&camel).unwrap(),
+            serde_yaml::to_value(&snake).unwrap()
+        );
+        // skip_serializing fields don't appear in Value; check directly.
+        let snake_nixpkgs = snake.nixpkgs.unwrap();
+        let camel_nixpkgs = camel.nixpkgs.unwrap();
+        assert_eq!(
+            camel_nixpkgs.config_.allowlisted_licenses,
+            snake_nixpkgs.config_.allowlisted_licenses
+        );
+        assert_eq!(
+            camel_nixpkgs.config_.blocklisted_licenses,
+            snake_nixpkgs.config_.blocklisted_licenses
+        );
+    }
+
+    // Platform merge: Vec fields accumulate across layers (deprecated top-level
+    // → nixpkgs base → per_platform.<system>). Same semantics as imports merge.
+    #[test]
+    fn nixpkgs_config_platform_merge_appends_vecs() {
+        let yaml = r#"
+permitted_insecure_packages: ["from-top"]
+nixpkgs:
+  cuda_capabilities: ["7.5"]
+  permitted_insecure_packages: ["from-base"]
+  per_platform:
+    x86_64-linux:
+      cuda_capabilities: ["8.0"]
+      permitted_insecure_packages: ["from-platform"]
+"#;
+        let cfg = load_yaml(yaml).nixpkgs_config("x86_64-linux");
+        assert_eq!(cfg.cuda_capabilities, vec!["7.5", "8.0"]);
+        assert_eq!(
+            cfg.permitted_insecure_packages,
+            vec!["from-top", "from-base", "from-platform"]
+        );
+    }
+
+    // Platform merge: bool fields OR across layers (any true wins).
+    #[test]
+    fn nixpkgs_config_platform_merge_ors_bools() {
+        let yaml = r#"
+nixpkgs:
+  allow_unfree: false
+  per_platform:
+    x86_64-linux:
+      allow_unfree: true
+"#;
+        assert!(load_yaml(yaml).nixpkgs_config("x86_64-linux").allow_unfree);
+    }
+
+    // Deprecated top-level fields still feed the platform merge (lowest layer).
+    #[test]
+    fn nixpkgs_config_reads_deprecated_top_level_fields() {
+        let yaml = r#"
+allow_unfree: true
+permitted_insecure_packages: ["from-top"]
+"#;
+        let cfg = load_yaml(yaml).nixpkgs_config("x86_64-linux");
+        assert!(cfg.allow_unfree);
+        assert_eq!(cfg.permitted_insecure_packages, vec!["from-top"]);
+    }
+
+    #[test]
+    fn config_write_includes_schema_comment() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let base_path = temp_dir.path();
+
+        let mut config = Config::default();
+        config
+            .add_input("nixpkgs-python", "github:cachix/nixpkgs-python", &[])
+            .expect("Failed to add an input to config");
+        config
+            .write_to(base_path)
+            .expect("Failed to write config file");
+
+        let yaml_path = base_path.join(YAML_CONFIG);
+        let read_content = fs::read_to_string(&yaml_path).expect("Failed to read devenv.yaml");
+        assert!(
+            read_content.starts_with(
+                "# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json\n"
+            ),
+            "Config file should start with schema comment, but got: {}",
+            read_content
         );
     }
 }

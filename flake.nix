@@ -26,7 +26,7 @@
     };
   };
   inputs.nix = {
-    url = "github:cachix/nix/devenv-2.32";
+    url = "github:cachix/nix/devenv-2.34";
     inputs = {
       nixpkgs.follows = "nixpkgs";
       flake-compat.follows = "flake-compat";
@@ -52,6 +52,19 @@
       flake-parts.follows = "flake-parts";
     };
   };
+  inputs.crate2nix = {
+    # https://github.com/nix-community/crate2nix/issues/439
+    url = "github:rossng/crate2nix/ba5dd398e31ee422fbe021767eb83b0650303a6e";
+    flake = false;
+  };
+  inputs.rust-overlay = {
+    url = "github:oxalica/rust-overlay";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+  inputs.ghostty = {
+    url = "github:ghostty-org/ghostty";
+    flake = false;
+  };
 
   outputs =
     { self
@@ -64,7 +77,6 @@
       systems = [
         "x86_64-linux"
         "i686-linux"
-        "x86_64-darwin"
         "aarch64-linux"
         "aarch64-darwin"
       ];
@@ -75,19 +87,33 @@
         system:
         let
           overlays = [
+            inputs.rust-overlay.overlays.default
             (final: prev: {
               inherit (inputs.cachix.packages.${system}) cachix;
-              nix = inputs.nix.packages.${system}.nix;
+              # Use nix-cli to skip building nix-manual, but keep libs for C bindings
+              nix = inputs.nix.packages.${system}.nix-cli // {
+                inherit (inputs.nix.packages.${system}.nix) libs;
+              };
               nixd = inputs.nixd.packages.${system}.nixd;
+              crate2nix = final.callPackage "${inputs.crate2nix}/crate2nix/default.nix" { };
+              libghostty-vt = final.callPackage "${inputs.ghostty}/nix/libghostty-vt.nix" { };
             })
           ];
           pkgs = import nixpkgs { inherit overlays system; };
           gitRev = self.shortRev or (self.dirtyShortRev or "");
-          workspace = pkgs.callPackage ./workspace.nix { inherit gitRev; };
+          # Use stable Rust from rust-overlay for crate2nix builds
+          # (nixpkgs' buildRustCrate uses Rust 1.73 which is too old for some deps)
+          rustToolchain = pkgs.rust-bin.stable.latest.default;
+          workspace = pkgs.callPackage ./nix/workspace.nix {
+            inherit gitRev;
+            rustc = rustToolchain;
+            cargo = rustToolchain;
+          };
         in
         {
-          inherit (workspace.crates) devenv devenv-tasks devenv-tasks-fast-build;
+          inherit (workspace.crates) devenv devenv-tasks;
           default = self.packages.${system}.devenv;
+          crate2nix = pkgs.crate2nix;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           devenv-image = import ./containers/devenv/image.nix {
@@ -193,7 +219,10 @@
             ]
             ++ args.modules;
 
-            project = lib.evalModules { inherit modules specialArgs; };
+            project = lib.evalModules {
+              class = "devenv";
+              inherit modules specialArgs;
+            };
           in
           project;
 

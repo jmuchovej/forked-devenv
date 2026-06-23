@@ -1,3 +1,13 @@
+!!! tip "devenv now supports native auto activation without direnv"
+    As of devenv 2.0, `devenv shell` supports **native shell reloading** and
+    [`devenv hook`](../auto-activation.md) provides **automatic activation when switching directories**
+    with no external dependencies.
+
+    For most workflows, `devenv shell` combined with `devenv hook` is the recommended approach.
+    direnv is still useful if you prefer in place environment modification without a subshell.
+
+    See the [auto activation guide](../auto-activation.md) for setup instructions.
+
 You can configure ``devenv`` to **seamlessly switch development environments** when navigating between project directories.
 
 This feature relies on a separate tool called [direnv](https://direnv.net) (not to be confused with devenv).
@@ -36,7 +46,10 @@ Create an `.envrc` file in your project directory with the following content:
 This file configures direnv to use devenv for shell activation.
 
 !!! note
-    `.envrc` is not created by `devenv init`. You need to create it manually.
+    `devenv init` does not create a `.envrc` file by default.
+
+!!! tip "New in version 2.2"
+    Use `devenv init --include-envrc` to include an `.envrc` file. On earlier versions, create it manually using the snippet above.
 
 ## Approving and loading the shell
 

@@ -1,15 +1,20 @@
 //! Reusable UI components for the TUI
 
 use crate::model::{Activity, ActivityVariant, NixActivityState};
+use devenv_activity::ProcessStatus;
 use human_repr::{HumanCount, HumanThroughput};
 use iocraft::prelude::*;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 // Import shared UI constants from devenv-shell
 pub use devenv_shell::{
     CHECKMARK, COLOR_ACTIVE, COLOR_ACTIVE_NESTED, COLOR_COMPLETED, COLOR_FAILED, COLOR_HIERARCHY,
-    COLOR_INFO, COLOR_INTERACTIVE, COLOR_SECONDARY, SPINNER_FRAMES, SPINNER_INTERVAL_MS, XMARK,
+    COLOR_INFO, COLOR_INTERACTIVE, COLOR_SECONDARY, COLOR_TRANSIENT, DOT_HALF, DOT_INERT,
+    DOT_READY, DOT_RING, DOT_RUNNING, PULSE_INTERVAL_MS, SPINNER_FRAMES, SPINNER_INTERVAL_MS,
+    XMARK,
 };
 
 /// Self-animating spinner component.
@@ -19,6 +24,17 @@ pub struct SpinnerProps {
     pub color: Option<Color>,
 }
 
+#[cfg(feature = "deterministic-tui")]
+#[component]
+pub fn Spinner(_hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'static>> {
+    let color = props.color.unwrap_or(COLOR_ACTIVE);
+
+    element! {
+        Text(content: SPINNER_FRAMES[0], color: color)
+    }
+}
+
+#[cfg(not(feature = "deterministic-tui"))]
 #[component]
 pub fn Spinner(mut hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'static>> {
     let mut frame = hooks.use_state(|| 0usize);
@@ -27,7 +43,10 @@ pub fn Spinner(mut hooks: Hooks, props: &SpinnerProps) -> impl Into<AnyElement<'
     hooks.use_future(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(SPINNER_INTERVAL_MS)).await;
-            frame.set((frame.get() + 1) % SPINNER_FRAMES.len());
+            let Some(val) = frame.try_get() else {
+                break;
+            };
+            frame.set((val + 1) % SPINNER_FRAMES.len());
         }
     });
 
@@ -64,17 +83,130 @@ pub fn StatusIndicator(
     }
 }
 
+/// Map a process status to its status-dot glyph, color, and whether it pulses.
+///
+/// Shape carries the lifecycle so the state reads without relying on color
+/// (color only reinforces); `pulse` marks transient states so motion signals
+/// "in progress" without an animated spinner.
+pub fn process_status_dot(
+    status: &ProcessStatus,
+    completed: Option<bool>,
+    shutting_down: bool,
+) -> (&'static str, Color, bool) {
+    // Global shutdown: every still-active process is draining.
+    if shutting_down && status.is_active() {
+        return (DOT_HALF, COLOR_HIERARCHY, true);
+    }
+    match status {
+        ProcessStatus::NotStarted => (DOT_INERT, COLOR_HIERARCHY, false),
+        ProcessStatus::Waiting => (DOT_RING, COLOR_TRANSIENT, true),
+        ProcessStatus::Starting | ProcessStatus::Restarting => (DOT_HALF, COLOR_TRANSIENT, true),
+        ProcessStatus::Running => (DOT_RUNNING, COLOR_COMPLETED, false),
+        ProcessStatus::Ready => (DOT_READY, COLOR_COMPLETED, false),
+        ProcessStatus::Stopping => (DOT_HALF, COLOR_HIERARCHY, true),
+        ProcessStatus::Stopped if completed == Some(false) => (XMARK, COLOR_FAILED, false),
+        ProcessStatus::Stopped => (DOT_RING, COLOR_HIERARCHY, false),
+    }
+}
+
+/// Process status dot. Static glyph for stable states; transient states
+/// (`pulse = true`) breathe between `color` and gray to signal liveness
+/// without the busy churn of a spinner.
+#[derive(Default, Props)]
+pub struct StatusDotProps {
+    pub glyph: String,
+    pub color: Option<Color>,
+    pub pulse: bool,
+}
+
+#[cfg(feature = "deterministic-tui")]
+#[component]
+pub fn StatusDot(_hooks: Hooks, props: &StatusDotProps) -> impl Into<AnyElement<'static>> {
+    let color = props.color.unwrap_or(COLOR_ACTIVE);
+    element! {
+        Text(content: props.glyph.clone(), color: color)
+    }
+}
+
+#[cfg(not(feature = "deterministic-tui"))]
+#[component]
+pub fn StatusDot(mut hooks: Hooks, props: &StatusDotProps) -> impl Into<AnyElement<'static>> {
+    let color = props.color.unwrap_or(COLOR_ACTIVE);
+
+    // Hooks must be called unconditionally and in a stable order every render
+    // (iocraft rules of hooks); `pulse` can flip as a process changes state,
+    // so always register them and gate only the rendering.
+    let mut bright = hooks.use_state(|| true);
+    // Non-reactive mirror of `pulse`, refreshed every render. The animation
+    // future reads it to decide whether to toggle `bright`. Writing a `Ref`
+    // does not mark the component dirty, so updating this never forces a redraw.
+    let mut pulse_active = hooks.use_ref(|| props.pulse);
+    pulse_active.set(props.pulse);
+    // Wake source so the animation future can fully park while the dot is
+    // steady, instead of polling a timer twice a second per dot — which would
+    // scale idle wakeups with the number of processes (#2915). We signal it on
+    // the steady -> pulsing transition; `notify_one` stores a permit, so a wake
+    // raised before the future parks is never lost.
+    let wake = hooks.use_ref(|| Arc::new(Notify::new()));
+    let mut was_pulsing = hooks.use_ref(|| false);
+    if props.pulse && !was_pulsing.get() {
+        wake.read().notify_one();
+    }
+    was_pulsing.set(props.pulse);
+
+    let wake_fut = wake.read().clone();
+    hooks.use_future(async move {
+        loop {
+            // Steady dot: park until it starts pulsing again, so a screen full
+            // of running processes wakes no timers.
+            if !pulse_active.try_get().unwrap_or(false) {
+                wake_fut.notified().await;
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(PULSE_INTERVAL_MS)).await;
+            // Re-check after sleeping. Use `try_get` (not the panicking `get`)
+            // so a dropped owner ends the loop cleanly, matching `bright` below.
+            let Some(active) = pulse_active.try_get() else {
+                break;
+            };
+            if !active {
+                continue;
+            }
+            let Some(val) = bright.try_get() else {
+                break;
+            };
+            bright.set(!val);
+        }
+    });
+
+    let shown = if props.pulse && !bright.get() {
+        COLOR_HIERARCHY
+    } else {
+        color
+    };
+    element!(Text(content: props.glyph.clone(), color: shown))
+}
+
 /// Build logs viewport height for collapsed preview (press 'e' to expand to fullscreen)
 pub const LOG_VIEWPORT_COLLAPSED: usize = 10;
 /// Viewport height for failed activities (show more context on failure)
 pub const LOG_VIEWPORT_FAILED: usize = 20;
 /// Reduced viewport height for tasks with showOutput=true (expands to full when selected)
 pub const LOG_VIEWPORT_SHOW_OUTPUT: usize = 3;
+/// Hard cap on the inline log preview's visual-row footprint. Long log lines
+/// wrap onto continuation rows, so the visual height can exceed `max_lines`;
+/// without a cap, e.g. 20 long lines × several wrap rows each would push the
+/// surrounding activity tree off-screen. Pressing 'e' opens the expanded view
+/// for unconstrained scrolling.
+pub const INLINE_LOG_MAX_VISUAL_ROWS: u32 = 50;
 
 /// Format elapsed time for display: ms -> s -> m s -> h m
 /// When `high_resolution` is true, shows ms for sub-second durations.
 /// When `high_resolution` is false, hides if < 300ms, otherwise shows x.xs resolution.
 pub fn format_elapsed_time(elapsed: Duration, high_resolution: bool) -> String {
+    if cfg!(feature = "deterministic-tui") {
+        return "[TIME]".to_string();
+    }
     let total_secs = elapsed.as_secs();
     if total_secs < 1 {
         if high_resolution {
@@ -181,7 +313,7 @@ impl ActivityTextComponent {
         depth: usize,
         prefix_children: Vec<AnyElement<'static>>,
     ) -> AnyElement<'static> {
-        let (shortened_name, show_suffix) = calculate_display_info(
+        let (shortened_name, display_suffix) = calculate_display_info(
             &self.name,
             terminal_width as u32,
             &self.action,
@@ -203,9 +335,7 @@ impl ActivityTextComponent {
             (Color::Reset, COLOR_SECONDARY, COLOR_HIERARCHY, None)
         } else if self.is_completed {
             (COLOR_ACTIVE_NESTED, COLOR_SECONDARY, COLOR_HIERARCHY, None)
-        } else if depth == 0 {
-            (COLOR_ACTIVE, COLOR_SECONDARY, COLOR_HIERARCHY, None)
-        } else if matches!(self.variant, ActivityVariant::Process(_)) {
+        } else if depth == 0 || matches!(self.variant, ActivityVariant::Process(_)) {
             (COLOR_ACTIVE, COLOR_SECONDARY, COLOR_HIERARCHY, None)
         } else {
             (COLOR_ACTIVE_NESTED, COLOR_SECONDARY, COLOR_HIERARCHY, None)
@@ -258,10 +388,10 @@ impl ActivityTextComponent {
                         } else {
                             vec![]
                         })
-                        #(if show_suffix && self.suffix.is_some() {
+                        #(if let Some(ref suffix_text) = display_suffix {
                             // Suffix always has a predecessor (action or name)
                             vec![element!(View(margin_left: 1) {
-                                Text(content: self.suffix.as_ref().expect("suffix should be Some when show_suffix is true"), color: suffix_color)
+                                Text(content: suffix_text, color: suffix_color)
                             }).into_any()]
                         } else {
                             vec![]
@@ -293,10 +423,10 @@ impl ActivityTextComponent {
                         } else {
                             vec![]
                         })
-                        #(if show_suffix && self.suffix.is_some() {
+                        #(if let Some(ref suffix_text) = display_suffix {
                             // Suffix always has a predecessor (action or name)
                             vec![element!(View(margin_left: 1) {
-                                Text(content: self.suffix.as_ref().expect("suffix should be Some when show_suffix is true"), color: suffix_color)
+                                Text(content: suffix_text, color: suffix_color)
                             }).into_any()]
                         } else {
                             vec![]
@@ -362,7 +492,9 @@ impl ProgressBarComponent {
             .saturating_sub(4); // Some padding
         let bar_width = available_width.clamp(10, 100); // Min 10, max 100 chars
 
-        let filled = (bar_width * self.percent as usize) / 100;
+        // Clamp to bar_width: progress can exceed 100% (e.g. reported bytes past
+        // the expected total), which would otherwise underflow `empty`.
+        let filled = ((bar_width * self.percent as usize) / 100).min(bar_width);
         let empty = bar_width - filled;
 
         // Split progress bar into filled and empty parts for coloring
@@ -568,7 +700,11 @@ impl<'a> DownloadActivityComponent<'a> {
     }
 }
 
-/// Calculate display info for activity considering terminal width
+/// Calculate display info for activity considering terminal width.
+///
+/// Returns `(shortened_name, optional_shortened_suffix)`. When space is tight,
+/// the suffix is truncated from the right first, then dropped, then the name
+/// is truncated from the left.
 pub fn calculate_display_info(
     path: &str,
     terminal_width: u32,
@@ -576,8 +712,8 @@ pub fn calculate_display_info(
     suffix: Option<&str>,
     elapsed: &str,
     depth: usize,
-) -> (String, bool) {
-    // Calculate base width without suffix: padding + indent + hierarchy + action + margin + name + margin + elapsed
+) -> (String, Option<String>) {
+    // Calculate base width: padding + indent + hierarchy + spinner + action + name_margin + elapsed
     let indent_width = if depth > 0 {
         2 + (depth - 1) * 2 // spinner offset (2) + nesting indent
     } else {
@@ -601,38 +737,47 @@ pub fn calculate_display_info(
 
     if base_width >= available_width {
         // Very constrained, hide suffix and use shortest possible path
-        return (shorten_store_path_aggressive(path), false);
+        return (shorten_store_path_aggressive(path), None);
     }
 
-    let remaining_width_without_suffix = available_width - base_width;
+    let remaining = available_width - base_width;
+    let suffix_total = suffix.map(|s| s.chars().count() + 1).unwrap_or(0); // +1 for leading margin
 
-    // Always show suffix if present - let flexbox overflow handle truncation
-    let show_suffix = suffix.is_some();
-    let suffix_width = suffix.map(|s| s.len() + 1).unwrap_or(0); // suffix + space prefix
-
-    let remaining_width_for_path = if show_suffix {
-        remaining_width_without_suffix.saturating_sub(suffix_width)
-    } else {
-        remaining_width_without_suffix
-    };
-
-    // If path fits in remaining width, don't shorten
-    if path.len() <= remaining_width_for_path {
-        return (path.to_string(), show_suffix);
+    // Everything fits
+    if path.len() + suffix_total <= remaining {
+        return (path.to_string(), suffix.map(|s| s.to_string()));
     }
 
-    // Path doesn't fit - truncate from the left to keep meaningful filename
-    if remaining_width_for_path > 4 {
-        // Use char indices to avoid slicing in the middle of UTF-8 characters
+    // Doesn't fit. Truncate suffix first, then drop it, then truncate name.
+    if let Some(suffix_str) = suffix {
+        let suffix_chars: Vec<char> = suffix_str.chars().collect();
+        // How much space is left for suffix after the name?
+        let space_for_suffix = remaining.saturating_sub(path.len() + 1); // +1 for margin
+        if space_for_suffix >= suffix_chars.len() {
+            // Suffix fits, name is the problem
+            return (path.to_string(), Some(suffix_str.to_string()));
+        }
+        if space_for_suffix >= 2 {
+            // Truncate suffix from the right
+            let kept: String = suffix_chars[..space_for_suffix - 1].iter().collect();
+            return (path.to_string(), Some(format!("{}…", kept)));
+        }
+        // No room for suffix at all, drop it
+        if path.len() <= remaining {
+            return (path.to_string(), None);
+        }
+    }
+
+    // No suffix (or dropped). Truncate name from the left.
+    if remaining > 4 {
         let chars: Vec<char> = path.chars().collect();
-        let start_char = chars.len().saturating_sub(remaining_width_for_path - 1);
+        let start_char = chars.len().saturating_sub(remaining - 1);
         let truncated_chars: String = chars.iter().skip(start_char).collect();
-        let truncated = format!("…{}", truncated_chars);
-        return (truncated, show_suffix);
+        return (format!("…{}", truncated_chars), None);
     }
 
-    // If extremely narrow, just show ellipsis
-    ("…".to_string(), false)
+    // Extremely narrow
+    ("…".to_string(), None)
 }
 
 /// Aggressively shorten a store path for very narrow terminals
@@ -659,16 +804,21 @@ fn shorten_store_path_aggressive(path: &str) -> String {
         }
     }
 
-    // Fallback: if it still looks like a hash, truncate and add ellipsis
+    // Fallback: if it still looks like a hash, truncate and add ellipsis.
+    // Truncate by characters, not bytes, so multi-byte UTF-8 never panics.
     if path.len() > 15 && path.chars().all(|c| c.is_alphanumeric()) {
         // Looks like just a hash, truncate to first few chars + ellipsis
-        format!("{}…", &path[..4])
+        let prefix: String = path.chars().take(4).collect();
+        format!("{}…", prefix)
     } else if path.len() > 20 {
         // For file paths (like evaluation paths), keep the end and truncate the beginning
         if path.contains('/') {
-            format!("…{}", &path[path.len() - 19..])
+            let chars: Vec<char> = path.chars().collect();
+            let tail: String = chars[chars.len().saturating_sub(19)..].iter().collect();
+            format!("…{}", tail)
         } else {
-            format!("{}…", &path[..19])
+            let prefix: String = path.chars().take(19).collect();
+            format!("{}…", prefix)
         }
     } else {
         path.to_string()
@@ -709,38 +859,53 @@ impl<'a> ExpandedContentComponent<'a> {
         self
     }
 
+    /// The last `max_lines` log lines, preserving chronological order. Wrapping
+    /// is left to iocraft's `Text` widget so word boundaries and unicode width
+    /// are handled correctly.
+    fn visible_lines(&self) -> Vec<String> {
+        let Some(lines) = self.lines else {
+            return Vec::new();
+        };
+        lines
+            .iter()
+            .rev()
+            .take(self.max_lines)
+            .rev()
+            .cloned()
+            .collect()
+    }
+
     pub fn render(&self) -> Vec<AnyElement<'static>> {
-        // Calculate indentation based on depth (2 base + 2 per depth level)
         let indent = 2 + (self.depth * 2);
 
-        if let Some(lines) = &self.lines
-            && !lines.is_empty()
-        {
-            // Take the last N lines that fit in collapsed viewport
-            let visible_lines: Vec<_> = lines.iter().rev().take(self.max_lines).rev().collect();
+        let lines = self.visible_lines();
+        if !lines.is_empty() {
+            let line_elements: Vec<AnyElement<'static>> = lines
+                .into_iter()
+                .map(|line| {
+                    element! {
+                        Text(content: format!(" {line}"), color: Color::AnsiValue(245))
+                    }
+                    .into_any()
+                })
+                .collect();
 
-            if !visible_lines.is_empty() {
-                let actual_height = visible_lines.len();
-
-                let mut line_elements = vec![];
-                for line in visible_lines {
-                    line_elements.push(
-                        element! {
-                            View(height: 1, flex_direction: FlexDirection::Row, padding_left: indent as u32, padding_right: 1) {
-                                Text(content: format!("│ {line}"), color: Color::AnsiValue(245))
-                            }
-                        }
-                        .into_any(),
-                    );
-                }
-
-                return vec![element! {
-                    View(height: actual_height as u32, flex_direction: FlexDirection::Column, overflow: Overflow::Hidden) {
+            return vec![
+                element! {
+                    View(
+                        flex_direction: FlexDirection::Column,
+                        overflow: Overflow::Hidden,
+                        margin_left: indent as u32,
+                        margin_right: 1,
+                        border_style: BorderStyle::Single,
+                        border_edges: Edges::Left,
+                        border_color: Color::AnsiValue(245),
+                    ) {
                         #(line_elements)
                     }
                 }
-                .into_any()];
-            }
+                .into_any(),
+            ];
         }
 
         // Fallback: show empty message with minimal height
@@ -752,29 +917,27 @@ impl<'a> ExpandedContentComponent<'a> {
         .into_any()]
     }
 
-    /// Calculate the height this component will take
+    /// Approximate visible height: one row per log line. The actual height after
+    /// `Text` wrapping may be larger, so callers that bound the inline view should
+    /// rely on a flex `max_height` rather than treating this as an upper bound.
     pub fn calculate_height(&self) -> usize {
-        if let Some(lines) = &self.lines
-            && !lines.is_empty()
-        {
-            let visible_count = lines.len().min(self.max_lines);
-            if visible_count > 0 {
-                return visible_count;
-            }
-        }
-        1 // Minimal height for empty message
+        let count = self.visible_lines().len();
+        if count > 0 { count } else { 1 }
     }
 
-    /// Render the component with a main activity line, returning a single element
-    /// with proper height calculation for the combined content.
+    /// Render the component with a main activity line. Height is content-sized
+    /// up to `INLINE_LOG_MAX_VISUAL_ROWS` so wrapped log lines aren't clipped
+    /// but a runaway wrap can't push the rest of the activity tree off-screen.
     pub fn render_with_main_line(&self, main_line: AnyElement<'static>) -> AnyElement<'static> {
         let mut elements = vec![main_line];
         elements.extend(self.render());
 
-        let total_height = (1 + self.calculate_height()) as u32;
-
         element! {
-            View(height: total_height, flex_direction: FlexDirection::Column) {
+            View(
+                flex_direction: FlexDirection::Column,
+                max_height: INLINE_LOG_MAX_VISUAL_ROWS,
+                overflow: Overflow::Hidden,
+            ) {
                 #(elements)
             }
         }
@@ -784,3 +947,258 @@ impl<'a> ExpandedContentComponent<'a> {
 
 /// Backwards-compatible alias
 pub type BuildLogsComponent<'a> = ExpandedContentComponent<'a>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // For depth=0, action="", elapsed="1.0s":
+    // base_width = padding(2) + spinner(2) + action(0+1) + name_margin(1) + elapsed(4) = 10
+    // remaining = terminal_width - 10
+
+    #[test]
+    fn everything_fits_with_suffix() {
+        // remaining = 100 - 10 = 90, name(24) + suffix(7+1margin) = 32 fits
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            100,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix.as_deref(), Some("4 lines"));
+    }
+
+    #[test]
+    fn everything_fits_without_suffix() {
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 80, "", None, "1.0s", 0);
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn long_suffix_truncated_before_name() {
+        // remaining = 60 - 10 = 50, name=24
+        // space_for_suffix = 50 - 24 - 1(margin) = 25 chars
+        // suffix(63 chars) > 25 so truncated to 25 chars (24 kept + …)
+        let long_suffix = "4 lines → DEVENV_EXPORT:VklSVFVBTF9FTlY==L2hvbWUvZG9tZW4vZGV2";
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            60,
+            "",
+            Some(long_suffix),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        let suffix = suffix.expect("suffix should be shown");
+        assert!(
+            suffix.starts_with("4 lines"),
+            "truncation preserves the start"
+        );
+        assert!(suffix.ends_with('…'));
+        assert_eq!(suffix.chars().count(), 25);
+    }
+
+    #[test]
+    fn suffix_dropped_when_only_1_char_available() {
+        // remaining = 36 - 10 = 26, name=24
+        // space_for_suffix = 26 - 24 - 1(margin) = 1 char, which is < 2 so suffix is dropped
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            36,
+            "",
+            Some("cached"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(name, "devenv:python:virtualenv");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn name_truncated_left_when_no_suffix() {
+        // remaining = 20 - 10 = 10, name=24 doesn't fit, 10 > 4 so left-truncate
+        // start_char = 24 - (10-1) = 15, keeps 9 chars + "…" = 10 chars
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 20, "", None, "1.0s", 0);
+        assert!(name.starts_with('…'));
+        assert_eq!(name.chars().count(), 10);
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn name_truncated_after_suffix_dropped() {
+        // remaining = 20 - 10 = 10, name=24 doesn't fit
+        // suffix can't fit either, gets dropped, then name is left-truncated to 10 chars
+        let (name, suffix) = calculate_display_info(
+            "devenv:python:virtualenv",
+            20,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert!(name.starts_with('…'));
+        assert_eq!(name.chars().count(), 10);
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn very_constrained_uses_aggressive_shortening() {
+        // base=10 >= terminal=5, hits shorten_store_path_aggressive
+        let (name, suffix) = calculate_display_info(
+            "/nix/store/abc123hash-some-package-1.0",
+            5,
+            "",
+            Some("4 lines"),
+            "1.0s",
+            0,
+        );
+        assert_eq!(suffix, None);
+        // shorten_store_path_aggressive keeps package name after hash
+        assert!(name.contains("some-package"), "got: {}", name);
+    }
+
+    #[test]
+    fn extremely_narrow_remaining() {
+        // remaining = 14 - 10 = 4, which is <= 4 so just "…"
+        let (name, suffix) =
+            calculate_display_info("devenv:python:virtualenv", 14, "", None, "1.0s", 0);
+        assert_eq!(name, "…");
+        assert_eq!(suffix, None);
+    }
+
+    #[test]
+    fn nesting_reduces_budget() {
+        // depth=0: base = 10, remaining = 42-10 = 32
+        // depth=2: base = padding(2)+indent(4)+hierarchy(2)+spinner(0)+action(0+1)+name_margin(1)+elapsed(4) = 14
+        //          remaining = 42 - 14 = 28
+        // name(24) + suffix("cached" 6+1margin) = 31
+        // depth=0: 32 >= 31, fits
+        // depth=2: 28 < 31, doesn't fit, space_for_suffix = 28-24-1 = 3 >= 2, so suffix truncated
+        let (_, suffix_shallow) = calculate_display_info(
+            "devenv:python:virtualenv",
+            42,
+            "",
+            Some("cached"),
+            "1.0s",
+            0,
+        );
+        let (name_deep, suffix_deep) = calculate_display_info(
+            "devenv:python:virtualenv",
+            42,
+            "",
+            Some("cached"),
+            "1.0s",
+            2,
+        );
+        assert_eq!(suffix_shallow.as_deref(), Some("cached"));
+        assert_eq!(name_deep, "devenv:python:virtualenv");
+        let s = suffix_deep.expect("suffix should be truncated not dropped");
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 3);
+    }
+
+    #[test]
+    fn action_reduces_budget() {
+        // action="building"(8+1=9)
+        // base = padding(2)+spinner(2)+action(9)+name_margin(1)+elapsed(4) = 18
+        // remaining = 60 - 18 = 42, name("some-package")=12
+        // space_for_suffix = 42 - 12 - 1 = 29
+        // suffix(56 chars) > 29 so truncated to 29 chars (28 kept + …)
+        let long_suffix = "4 lines → DEVENV_EXPORT:VklSVFVBTF9FTlY==L2hvbWUvZG9tZW4";
+        let (name, suffix) =
+            calculate_display_info("some-package", 60, "building", Some(long_suffix), "1.0s", 0);
+        assert_eq!(name, "some-package");
+        let suffix = suffix.expect("suffix should be truncated");
+        assert!(suffix.ends_with('…'));
+        assert_eq!(suffix.chars().count(), 29);
+    }
+
+    #[test]
+    fn multibyte_suffix_does_not_panic() {
+        // Suffix with multi-byte UTF-8 chars: .len() (bytes) > .chars().count()
+        // This previously panicked because byte length was used for comparison
+        // but char index was used for slicing.
+        // "ä" is 2 bytes in UTF-8, so 30 chars = 60 bytes.
+        // With terminal_width=80, action="building", path="pkg":
+        //   base_width = 2+2+9+1+4 = 18, remaining = 62
+        //   space_for_suffix = 62 - 3 - 1 = 58
+        //   Old code: 58 >= suffix.len()(60) → false, then chars[..57] on 30-char vec → panic!
+        let suffix = "ääääääääääääääääääääääääääääää"; // 30 chars, 60 bytes
+        let (name, _suffix) =
+            calculate_display_info("pkg", 80, "building", Some(suffix), "1.0s", 0);
+        assert_eq!(name, "pkg");
+    }
+
+    #[test]
+    fn expanded_content_keeps_last_max_lines_in_chronological_order() {
+        let mut logs = VecDeque::new();
+        logs.push_back("one".to_string());
+        logs.push_back("two".to_string());
+        logs.push_back("three".to_string());
+        logs.push_back("four".to_string());
+
+        let component = ExpandedContentComponent::new(Some(&logs)).with_max_lines(2);
+
+        assert_eq!(
+            component.visible_lines(),
+            vec!["three".to_string(), "four".to_string()]
+        );
+    }
+
+    #[test]
+    fn expanded_content_passes_long_lines_through_unchanged() {
+        // Long lines are wrapped by iocraft's Text widget at render time, not
+        // shortened here; verify the full line survives `visible_lines`.
+        let long = "INFO    -  [12:00:00] Serving on http://127.0.0.1:8000/".to_string();
+        let mut logs = VecDeque::new();
+        logs.push_back(long.clone());
+
+        let component = ExpandedContentComponent::new(Some(&logs)).with_max_lines(3);
+
+        assert_eq!(component.visible_lines(), vec![long]);
+    }
+
+    #[test]
+    fn inline_log_view_wraps_long_url_at_narrow_terminal() {
+        // Reproduce the user's reported scenario: at a narrow terminal width a
+        // long mkdocs-style URL line should wrap onto continuation rows with
+        // every char of the original line still present.
+        let mut logs = VecDeque::new();
+        let line = "INFO    -  [13:23:16] Serving on http://127.0.0.1:8000/".to_string();
+        logs.push_back(line.clone());
+
+        let component = ExpandedContentComponent::new(Some(&logs))
+            .with_max_lines(3)
+            .with_depth(1);
+
+        let elements = component.render();
+        let mut elem = element! {
+            View(width: 40u32, flex_direction: FlexDirection::Column) {
+                #(elements)
+            }
+        };
+        let out = elem.render(Some(40)).to_string();
+
+        // No ellipsis truncation, and every char of the URL appears somewhere
+        // in the rendered output (possibly across wrap rows).
+        assert!(
+            !out.contains('…'),
+            "rendered output contained ellipsis:\n{}",
+            out
+        );
+        // The most distinctive tail of the URL should appear unmodified on
+        // some visual row (iocraft wraps at the last word boundary so "/"
+        // ends up on its own row after "Serving on").
+        assert!(
+            out.contains("http://127.0.0.1:8000/"),
+            "expected URL to appear intact in wrapped output:\n{}",
+            out
+        );
+    }
+}

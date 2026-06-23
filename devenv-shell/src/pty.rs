@@ -86,7 +86,7 @@ impl Pty {
 
     /// Resize the PTY.
     pub fn resize(&self, size: PtySize) -> Result<(), PtyError> {
-        let master = self.master.lock().unwrap();
+        let master = self.master.lock().unwrap_or_else(|e| e.into_inner());
         master
             .resize(size)
             .map_err(|e| PtyError::Resize(e.to_string()))
@@ -94,15 +94,15 @@ impl Pty {
 
     /// Try to wait for the child process without blocking.
     pub fn try_wait(&self) -> Result<Option<portable_pty::ExitStatus>, PtyError> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         child
             .try_wait()
             .map_err(|e| PtyError::Io(io::Error::other(e.to_string())))
     }
 
-    /// Kill the PTY child process.
+    /// Kill the PTY child process. Recovers from a poisoned mutex.
     pub fn kill(&self) -> Result<(), PtyError> {
-        let mut child = self.child.lock().unwrap();
+        let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
         child
             .kill()
             .map_err(|e| PtyError::Io(io::Error::other(e.to_string())))
@@ -111,20 +111,12 @@ impl Pty {
 
 /// Get the current terminal size.
 pub fn get_terminal_size() -> PtySize {
-    if let Some((cols, rows)) = term_size::dimensions() {
-        PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    } else {
-        PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
     }
 }
 

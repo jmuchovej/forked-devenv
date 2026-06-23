@@ -14,6 +14,32 @@ You don't need to install Cachix client, devenv will handle binary caching for y
 
 After that you'll need to set `CACHIX_AUTH_TOKEN=XXX` with either [a personal auth token](https://app.cachix.org/personal-auth-tokens) or a per cache token (that you can create in cache settings).
 
+!!! tip "New in version 2.1.3"
+
+    If `CACHIX_AUTH_TOKEN` is not set in the environment, devenv resolves the
+    token from, in order:
+
+    1. a `CACHIX_AUTH_TOKEN` secret declared in [secretspec](integrations/secretspec.md), then
+    2. the auth token stored by the Cachix CLI (`cachix authtoken`) in
+       `$XDG_CONFIG_HOME/cachix/cachix.dhall` (usually `~/.config/cachix/cachix.dhall`).
+
+    The resolved token is used for both pulling from private caches and
+    pushing (it is passed to the cachix push daemon), so neither requires
+    exporting the token into your environment.
+
+    The secretspec secret name defaults to `CACHIX_AUTH_TOKEN` and is
+    overridable via [`secretspec.cachix_auth_token`](reference/yaml-options.md#secretspeccachix_auth_token)
+    in `devenv.yaml`. Override it when your secretspec backend's policy
+    (e.g. OpenBao/Vault) only grants access to the token under a
+    different name:
+
+    ```yaml title="devenv.yaml"
+    secretspec:
+      enable: true
+      provider: openbao
+      cachix_auth_token: MY_TEAM_CACHIX_TOKEN
+    ```
+
 ## Pull
 
 Configure your new cache:

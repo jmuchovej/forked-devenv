@@ -1,3 +1,4 @@
+# Compatibility layer for devenv to work inside of a `nix develop` shell.
 { config
 , pkgs
 , lib
@@ -12,10 +13,18 @@ let
 
   # Helper function to wrap commands with nix develop
   #
-  # This is skipped if the user is already in a shell launched by direnv.
-  # We trust that direnv will handle reloads.
+  # This is skipped if the user is already in a devenv shell loaded by direnv.
+  # direnv watches flake.nix/flake.lock and reloads the env automatically, so
+  # re-entering would be wasted work. Outside direnv (raw `nix develop`, fresh
+  # invocation, foreign-flake consumer), we re-enter to pick up any changes;
+  # nix resolves `.` by walking up for flake.nix and surfaces its own error if
+  # none is found.
+  #
+  # `$DIRENV_DIR` is exported by direnv on every load. `$DEVENV_IN_DIRENV_SHELL`
+  # is the legacy opt-in flag from the official templates; honored for
+  # backwards compatibility with older `.envrc` files.
   wrapWithNixDevelop = command: args: ''
-    if [[ -n "$IN_NIX_SHELL" && "$DEVENV_IN_DIRENV_SHELL" == "true" ]]; then
+    if [[ -n "$DEVENV_PROFILE" && ( -n "$DIRENV_DIR" || "$DEVENV_IN_DIRENV_SHELL" == "true" ) ]]; then
       exec ${command} ${args}
     else
       exec nix develop .#${shellName} --impure ${nixFlags} -c ${command} ${args}
@@ -92,7 +101,19 @@ let
   # `devenv tasks` helper command
   devenv-flake-tasks =
     pkgs.writeShellScriptBin "devenv-flake-tasks" ''
-      exec ${config.task.package}/bin/devenv-tasks "$@"
+      subcommand=$1
+      shift
+      case "$subcommand" in
+        run)
+          exec ${config.task.package}/bin/devenv-tasks run \
+            --cache-dir ${lib.escapeShellArg config.devenv.dotfile} \
+            --runtime-dir ${lib.escapeShellArg config.devenv.runtime} \
+            "$@"
+          ;;
+        *)
+          exec ${config.task.package}/bin/devenv-tasks "$subcommand" "$@"
+          ;;
+      esac
     '';
 
   devenvFlakeCompat = pkgs.symlinkJoin {
@@ -107,6 +128,26 @@ let
 in
 {
   config = lib.mkIf config.devenv.flakesIntegration {
+    assertions = [
+      {
+        assertion = config.devenv.root != "";
+        message = ''
+          devenv was not able to determine the current directory.
+
+          See https://devenv.sh/guides/using-with-flakes/ how to use it with flakes.
+        '';
+      }
+    ];
+
+    devenv.root = lib.mkDefault (builtins.getEnv "PWD");
+    # Used for TMPDIR override - should NOT use XDG_RUNTIME_DIR as that's
+    # a small tmpfs meant for runtime files (sockets), not build artifacts
+    devenv.tmpdir =
+      let
+        tmp = builtins.getEnv "TMPDIR";
+      in
+      lib.mkDefault (if tmp != "" then tmp else "/tmp");
+
     env.DEVENV_FLAKE_SHELL = shellName;
 
     # Add the flake command helpers directly to the path.

@@ -21,6 +21,11 @@ let
   # Check if any individual hooks are enabled
   anyHookEnabled = builtins.any (hook: hook.enable or false) (lib.attrValues (cfg.hooks or { }));
 
+  # Absolute config path (quoted for shell use): git runs hooks from the
+  # repository toplevel, which differs from the devenv root when devenv
+  # lives in a subdirectory.
+  configArg = ''"$DEVENV_ROOT/${cfg.configPath}"'';
+
   # A default module stub for when git-hooks is not available.
   # Uses freeformType to accept any attributes (tools, hooks, etc.) without type errors.
   defaultModule = lib.types.submoduleWith {
@@ -54,7 +59,7 @@ let
             {
               rootSrc = self;
               package = lib.mkDefault pkgs.prek;
-              tools = import (git-hooks + "/nix/call-tools.nix") pkgs;
+              tools = lib.mapAttrs (_: lib.mkOptionDefault) (import (git-hooks + "/nix/call-tools.nix") pkgs);
             }
           ];
           specialArgs = { inherit pkgs; };
@@ -63,17 +68,26 @@ let
     else
       defaultModule;
 
-  # `propagatedBuildInputs` in Python apps are leaked into the environment.
-  # This normally leaks the Python interpreter and its site-packages, causing collision errors.
-  # This affects all packages built with `buildPythonApplication` or `toPythonApplication`.
-  # pre-commit is particularly annoying as it is difficult for end-users to track down.
+  # Python-based hook runners (e.g. pre-commit) leak their propagatedBuildInputs
+  # into PATH via their wrapper script, which prepends a bare Python interpreter
+  # that shadows the user's venv/devenv python.
+  # Re-wrap without --prefix PATH so only PYTHONPATH is set.
   # Tracking: https://github.com/NixOS/nixpkgs/issues/302376
-  packageBin =
-    pkgs.runCommandLocal "pre-commit-bin" { meta.mainProgram = cfg.package.meta.mainProgram; }
-      ''
-        mkdir -p $out/bin
-        ln -s ${lib.getExe cfg.package} $out/bin/${cfg.package.meta.mainProgram}
-      '';
+  package =
+    if cfg.package ? dontWrapPythonPrograms then
+      cfg.package.overrideAttrs
+        {
+          dontWrapPythonPrograms = true;
+          postFixup = ''
+            buildPythonPath "$out $pythonPath"
+            wrapProgramShell $out/bin/${cfg.package.meta.mainProgram} \
+              --set PYTHONPATH "$program_PYTHONPATH" \
+              --set PYTHONNOUSERSITE true \
+              --suffix PATH : ${lib.makeBinPath [ cfg.gitPackage ]}
+          '';
+        }
+    else
+      cfg.package;
 
 in
 {
@@ -117,8 +131,7 @@ in
 
     (lib.mkIf cfg.enable {
       ci = [ cfg.run ];
-      # Add the packages for any enabled hooks at the end to avoid overriding the language-defined packages.
-      packages = lib.mkAfter ([ packageBin ] ++ (cfg.enabledPackages or [ ]));
+      packages = lib.mkAfter ([ package ] ++ (cfg.enabledPackages or [ ]));
       env.PREK_HOME = "${config.devenv.state}/prek";
       enterShell = lib.mkAfter ''
         mkdir -p "$PREK_HOME"
@@ -126,15 +139,10 @@ in
 
       tasks = {
         "devenv:git-hooks:install" = {
-          # The config file is managed by the files API (see files.${cfg.configPath} below).
-          # We write a custom install script here instead of using cfg.installationScript
-          # because the upstream script skips installation when the config symlink exists,
-          # but with the files API the symlink is created before this task runs.
           exec =
             let
-              executable = lib.getExe packageBin;
+              executable = lib.getExe package;
               git = lib.getExe cfg.gitPackage;
-              configPath = cfg.configPath;
               installStages = cfg.installStages;
             in
             ''
@@ -146,7 +154,7 @@ in
               # Install hooks for configured stages
               if [ -z "${lib.concatStringsSep " " installStages}" ]; then
                 # Default: install pre-commit hook
-                ${executable} install -c ${configPath}
+                ${executable} install -c ${configArg}
               else
                 for stage in ${lib.concatStringsSep " " installStages}; do
                   case $stage in
@@ -154,10 +162,10 @@ in
                       # Skip manual stage - it's not a git hook
                       ;;
                     commit|merge-commit|push)
-                      ${executable} install -c ${configPath} -t "pre-$stage"
+                      ${executable} install -c ${configArg} -t "pre-$stage"
                       ;;
                     *)
-                      ${executable} install -c ${configPath} -t "$stage"
+                      ${executable} install -c ${configArg} -t "$stage"
                       ;;
                   esac
                 done
@@ -167,7 +175,7 @@ in
           before = [ "devenv:enterShell" ];
         };
         "devenv:git-hooks:run" = {
-          exec = "${packageBin.meta.mainProgram} run -a";
+          exec = "${lib.getExe package} run -a -c ${configArg}";
           after = [ "devenv:git-hooks:install" ];
           before = [ "devenv:enterTest" ];
         };

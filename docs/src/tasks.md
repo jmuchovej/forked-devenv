@@ -40,9 +40,83 @@ Succeeded         myapp:test          350ms
 3 Succeeded                           479.14ms
 ```
 
+## Dependencies between tasks
+
+Tasks form a dependency graph (a DAG). Declare an edge between two tasks with `before` or `after`:
+
+- `after = [ "other" ]` — run this task *after* `other` (`other` is a dependency, "upstream").
+- `before = [ "other" ]` — run this task *before* `other` (`other` is "downstream" and depends on this one).
+
+Processes are tasks too (see [Processes as tasks](#processes-as-tasks)), so the same `before`/`after` edges connect tasks and processes interchangeably — see [process dependencies](processes.md#dependencies) for process-focused examples.
+
+`before` and `after` describe the same edge from opposite ends, so you can declare a dependency from whichever side is more convenient. These are equivalent:
+
+```nix title="devenv.nix"
+{
+  # declared from the dependent task
+  tasks."myapp:build".after = [ "myapp:generate" ];
+
+  # ...is the same edge as declaring it from the dependency
+  tasks."myapp:generate".before = [ "myapp:build" ];
+}
+```
+
+### Dependency states
+
+!!! tip "New in version 2.0"
+
+A dependency waits for its target to reach a particular state before it is considered satisfied. Append an `@` suffix to choose the state explicitly:
+
+| Suffix | Satisfied when | Failure propagates? |
+| --- | --- | --- |
+| `@started` | the target has begun executing | yes |
+| `@ready` | a process passes its [readiness probe](processes.md#ready-probes); for oneshot tasks this means success | yes |
+| `@succeeded` | the target exits with code `0` (or is skipped) | yes |
+| `@completed` | the target finishes, regardless of exit code | no (soft dependency) |
+
+When no suffix is given the default is `@ready` for processes and `@succeeded` for oneshot tasks.
+
+A common use is running a setup task once a service is ready:
+
+```nix title="devenv.nix"
+{
+  tasks."myapp:configure" = {
+    exec = "create-buckets";
+    after = [ "devenv:processes:garage@ready" ];
+  };
+}
+```
+
+## Execution modes
+
+!!! tip "New in version 2.1"
+
+When you run a task, devenv schedules a subgraph around it rather than only that one task. `--mode` controls how much of the graph is included:
+
+| Mode | Runs |
+| --- | --- |
+| `single` | only the named task |
+| `before` (default) | the task and everything *upstream* of it (its dependencies) |
+| `after` | the task and everything *downstream* of it (tasks that depend on it) |
+| `all` | the entire connected graph, both upstream and downstream |
+
+```shell-session
+$ devenv tasks run myapp:build               # before mode (default): build + its dependencies
+$ devenv tasks run myapp:build --mode single # just build
+$ devenv tasks run myapp:build --mode all    # build, its dependencies, and its dependents
+```
+
+`devenv up` starts processes in `before` mode, while `devenv test` runs in `all` mode. This difference matters for setup tasks attached to processes — see [Processes as tasks](#processes-as-tasks).
+
 ## enterShell / enterTest
 
-If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
+`devenv:enterShell` and `devenv:enterTest` are built-in lifecycle events that run setup tasks at specific points:
+
+- **`devenv:enterShell`** runs before the shell is entered (`devenv shell`) and before processes start (`devenv up`).
+- **`devenv:enterTest`** runs before tests execute (`devenv test`).
+  It depends on `devenv:enterShell`, so all shell setup tasks run first automatically.
+
+To hook into these events, use `before` to declare that your task should run before the event completes:
 
 ```nix title="devenv.nix"
 { pkgs, lib, config, ... }:
@@ -51,7 +125,12 @@ If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
   tasks = {
     "bash:hello" = {
       exec = "echo 'Hello world from bash!'";
-      before = [ "devenv:enterShell" "devenv:enterTest" ];
+      before = [ "devenv:enterShell" ];
+    };
+
+    "myapp:test-setup" = {
+      exec = "echo 'Preparing test fixtures...'";
+      before = [ "devenv:enterTest" ];
     };
   };
 }
@@ -61,11 +140,14 @@ If you'd like the tasks to run as part of the `enterShell` or `enterTest`:
 $ devenv shell
 ...
 Running tasks     devenv:enterShell
-Succeeded         devenv:pre-commit:install 25ms
+Succeeded         devenv:git-hooks:install  25ms
 Succeeded         bash:hello                 9ms
 Succeeded         devenv:enterShell         13ms
 3 Succeeded                                 28.14ms
 ```
+
+Many devenv modules automatically hook into these events.
+For example, enabling git hooks registers `devenv:git-hooks:install` as a dependency of `devenv:enterShell`.
 
 ## Using your favourite language
 
@@ -142,6 +224,7 @@ Tasks support passing inputs and produce outputs, both as JSON objects:
 - `$DEVENV_TASK_INPUT`: JSON object of `tasks."myapp:mytask".input`.
 - `$DEVENV_TASKS_OUTPUTS`: JSON object with dependent tasks as keys and their outputs as values.
 - `$DEVENV_TASK_OUTPUT_FILE`: a writable file with tasks' outputs in JSON.
+- `$DEVENV_TASK_EXPORTS_FILE`: a writable file where tasks can export environment variables. Write `name\0base64(value)\0` pairs to this file and they will be set in the environment of dependent tasks.
 
 ```nix title="devenv.nix"
 { pkgs, lib, config, ... }:
@@ -161,6 +244,29 @@ Tasks support passing inputs and produce outputs, both as JSON objects:
   };
 }
 ```
+
+### Shell messages
+
+!!! tip "New in version 2.1"
+
+Tasks can display messages to the user when entering the shell by writing a `devenv.messages` array to `$DEVENV_TASK_OUTPUT_FILE`. This is useful for showing informational output like trace URLs or setup status after initialization.
+
+```nix title="devenv.nix"
+{ pkgs, lib, config, ... }:
+
+{
+  tasks = {
+    "myapp:info" = {
+      exec = ''
+        echo '{"devenv":{"messages":["Setup complete. Dashboard: http://localhost:3000"]}}' > "$DEVENV_TASK_OUTPUT_FILE"
+      '';
+      before = [ "devenv:enterShell" ];
+    };
+  };
+}
+```
+
+Messages are printed after the shell environment is loaded, so they remain visible in the interactive session.
 
 ### Passing inputs from the CLI
 
@@ -216,11 +322,12 @@ When you run `devenv tasks run devenv:processes:web-server`, it will:
 2. Then execute the process itself
 
 This is particularly useful for:
+
 - Running setup tasks before starting a process
 - Creating complex startup sequences
 - Testing individual processes without starting all of them
 
-You can also run tasks after a process finishes by using the `after` attribute:
+You can also run tasks after a process finishes by depending on its `@completed` state (see [Dependency states](#dependency-states)). The default suffix for a process dependency is `@ready`, which fires as soon as the process is healthy, so use `@completed` to wait for it to exit instead:
 
 ```nix title="devenv.nix"
 { pkgs, ... }:
@@ -238,12 +345,18 @@ You can also run tasks after a process finishes by using the `after` attribute:
       rm -f ./server.pid
       rm -rf ./tmp/cache/*
     '';
-    after = [ "devenv:processes:app-server" ];
+    after = [ "devenv:processes:app-server@completed" ];
   };
 }
 ```
 
 This ensures that cleanup tasks like removing PID files or clearing caches are executed when the application server stops.
+
+!!! warning "Setup tasks attached to processes and `devenv up`"
+
+    A task that runs *after* a process — a setup or configure step wired with `processes.<name>.before = [ "devenv:<name>:configure" ]`, or equivalently `tasks."devenv:<name>:configure".after = [ "devenv:processes:<name>" ]` — is *downstream* of that process. `devenv up` schedules processes in `before` mode, which runs each process's upstream dependencies but **not** its downstream tasks, so the setup step is skipped and never runs.
+
+    Until this is resolved ([#2852](https://github.com/cachix/devenv/issues/2852)), run `devenv up --mode all` to include downstream setup tasks. `devenv test` already runs in `all` mode, so these tasks run there. See [Execution modes](#execution-modes).
 
 ## Git Integration
 

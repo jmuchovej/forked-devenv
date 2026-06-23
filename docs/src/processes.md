@@ -25,9 +25,27 @@ To start the processes, run:
 $ devenv up
 ```
 
+To stop detached processes:
+
+```shell-session
+$ devenv down
+```
+
+!!! tip "New in devenv 2.1.3"
+
+    `devenv down` is a shorthand for `devenv processes down`.
+
+To wait for all processes to become ready (useful in CI):
+
+```shell-session
+$ devenv processes wait --timeout 120
+```
+
+The default timeout is 120 seconds.
+
 ## Dependencies
 
-Processes can depend on other processes using `after` and `before`:
+Processes can depend on other processes and tasks using `after` and `before`:
 
 ```nix title="devenv.nix"
 {
@@ -42,7 +60,25 @@ Processes can depend on other processes using `after` and `before`:
 }
 ```
 
-Use `@complete` to wait for a process to stop (soft dependency), or `@ready` (default) for readiness.
+Dependency suffixes control when a dependency is considered satisfied.
+
+For **process** dependencies:
+
+- `@started` — wait for the process to begin execution
+- `@ready` (default) — wait for the readiness probe to pass
+- `@completed` — wait for the process to finish, regardless of exit code (soft dependency, does not propagate failure)
+
+For **task** dependencies:
+
+- `@started` — wait for the task to begin execution
+- `@succeeded` (default) — wait for the task to exit with code 0
+- `@completed` — wait for the task to finish, regardless of exit code (soft dependency, does not propagate failure)
+
+See [Dependency states](tasks.md#dependency-states) for the full semantics, and [Execution modes](tasks.md#execution-modes) for how `devenv up` and `devenv tasks run` decide which dependencies to schedule.
+
+!!! warning "Setup tasks that run after a process"
+
+    `devenv up` schedules processes in `before` mode, which runs each process's upstream dependencies but **not** tasks that run *after* it. A setup or configure task wired downstream of a process — e.g. `processes.<name>.before = [ "devenv:<name>:configure" ]` — is skipped under `devenv up` and never runs. Use `devenv up --mode all`, or see [Processes as tasks](tasks.md#processes-as-tasks) for details.
 
 ## Using Pre-built Services
 
@@ -149,9 +185,10 @@ All probe types support these timing options:
       http.get = { port = 8080; path = "/health"; };
       initial_delay = 2;    # seconds before first probe (default: 0)
       period = 10;           # seconds between probes (default: 10)
-      timeout = 1;           # seconds before probe times out (default: 1)
+      probe_timeout = 1;           # seconds before probe times out (default: 1)
       success_threshold = 1; # consecutive successes needed (default: 1)
       failure_threshold = 3; # consecutive failures before unhealthy (default: 3)
+      # timeout = ; Overall deadline in seconds for the process to become ready. null = no deadline.
     };
   };
 }
@@ -177,6 +214,31 @@ Automatically restart processes when files change:
   };
 }
 ```
+
+This works for both long-running processes and one-shot commands. A
+long-running process (such as `cargo run`) is restarted on each change. A
+one-shot command that exits immediately is re-run on each change — the watcher
+stays active after the command exits.
+
+```nix title="devenv.nix"
+{
+  # Prints a line every time a file in ./src changes.
+  processes.on-change = {
+    exec = "echo 'a file in ./src changed'";
+    watch = {
+      paths = [ ./src ];
+    };
+  };
+}
+```
+
+!!! note "Path resolution"
+
+    `watch.paths` entries are resolved relative to the location of your
+    `devenv.nix` (the project root), **not** relative to the process's `cwd`.
+    Use path literals such as `./src` rather than strings; they are passed to
+    the watcher as absolute paths. The `cwd` option only sets the working
+    directory for `exec`.
 
 ## Socket Activation
 
@@ -290,11 +352,20 @@ This is particularly useful for:
 
 ### Strict port mode
 
-If you want devenv to fail when a port is already in use instead of automatically finding the next available port, use the `--strict-ports` flag:
+If you want devenv to fail when a port is already in use instead of automatically finding the next available port, you can set the default in `devenv.yaml`:
+
+```yaml
+strict_ports: true
+```
+
+Or override it for a single run with CLI flags:
 
 ```shell-session
 $ devenv up --strict-ports
+$ devenv up --no-strict-ports
 ```
+
+The CLI flags take precedence over the config value.
 
 This is useful when you need deterministic port assignments and want to be notified of conflicts rather than having them silently resolved. When a port conflict is detected in strict mode, devenv will show an error message including which process is currently using the port.
 
